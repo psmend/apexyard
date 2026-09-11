@@ -281,7 +281,7 @@ One-line summary per skill; canonical details live in each `.claude/skills/<name
 | `/roadmap` | Update or create the product roadmap |
 | `/stakeholder-update` | Generate weekly / monthly / launch stakeholder updates |
 | `/fan-out` | Spawn N parallel agents in one message (per-task agent type, worktree isolation) |
-| `/mail-review` | Audit HTML email templates — a deterministic lint pass (contrast, palette, font fallbacks, layout, family rules) plus Barid's judgement pass on register, copy, images-off and consent. Gated in CI via `mail-lint.yml`, not by a merge hook (AgDR-0123) |
+| `/mail-review` | Audit HTML email templates — deterministic lint (contrast, palette, fonts, layout) plus Barid's judgement pass on register, copy and consent. Gated in CI (AgDR-0123) |
 
 The hooks, agents, and skills are picked up automatically by Claude Code when this directory lives at the project root. The rules are imported via `@.claude/rules/*.md` from your project's `CLAUDE.md`.
 

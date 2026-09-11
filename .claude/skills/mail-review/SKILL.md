@@ -1,6 +1,6 @@
 ---
 name: mail-review
-description: Audit HTML email templates — a deterministic lint pass (contrast, palette, font fallbacks, layout, family rules) plus Barid's judgement pass on register, copy, images-off and consent. The email analog of /code-review.
+description: Audit HTML email templates — deterministic lint (contrast, palette, fonts, layout, family rules) plus Barid's judgement pass on register, copy and consent. The email analog of /code-review.
 ---
 
 # /mail-review — Audit email templates
