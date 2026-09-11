@@ -296,6 +296,11 @@ EXTRA="" write_template
 sed -i 's|<tr><td style="background-color:#FFFDF9;padding:32px;">|<tr><td style="background: url(band.png);padding:32px;">|' "$FIX/emails/t.html"
 check "reports a CTA sitting on an image ground" "background IMAGE"
 
+# A gradient is no more measurable than a photograph - resolving it to its
+# first stop would be a guess reported as a measurement.
+EXTRA='<tr><td style="background: linear-gradient(to right, #FFFDF9, #131110);"><font color="#FFFDF9">faint</font></td></tr>' write_template
+check "does not measure against a gradient's first stop" "unreadable-colour"
+
 # An explicit colour alongside a url() is still found.
 EXTRA='<tr><td style="background: url(hero.png) #FFFDF9;"><font color="#FFFDF9">faint</font></td></tr>' write_template
 check "finds the colour when a url() precedes it" "contrast"

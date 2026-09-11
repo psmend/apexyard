@@ -176,8 +176,8 @@ every one of these lived.
 
 ## Postscript 3 - the colour grammar, and a gate with a switch on it
 
-A third review round found five more, and the pattern is sharper than in
-postscript 2. Every one lived in code written to *fix* an earlier finding.
+A third review round found four (a fifth, below, turned out not to be a
+defect at all), and the pattern is sharper than in postscript 2. Every one lived in code written to *fix* an earlier finding.
 
 **The linter could be switched off from inside a template.** Comments were
 found with `<!--.*?-->`. A `<!--` inside a quoted attribute value is literal
@@ -211,11 +211,34 @@ and `contrast` is only claimed as run when a comparison actually happened.
 fix and the photo fix shipped in the same commit, one removing an
 ERROR-severity false positive and the other introducing one.
 
-**The CI summary step failed on every healthy run.** Its two `python3 -c`
-programs were indented to sit inside the YAML block, and `-c` does not strip a
-common indent - `IndentationError` on line 2, under `set -e`, on any run that
-produced a report. The step written to prevent silence about unrun checks
-would have blocked every clean merge through the red-CI gate. Heredocs now.
+**The CI summary step was reported broken and was not.** A review found the
+two `python3 -c` programs indented to sit inside the YAML block and concluded
+they would raise `IndentationError` under `set -e` on every run that produced
+a report. The first version of this postscript recorded that as fact. It is
+wrong: a YAML block scalar strips the block's *common* indent, and those lines
+sat at exactly it, so Python received an unindented program. Extracting the
+step with real block-scalar semantics and running it under `bash -e` exits 0
+and writes the correct summary. The reproduction that appeared to confirm the
+bug used a shell heredoc, which preserves the indentation YAML removes - it
+tested the harness, not the step.
+
+The change to heredocs stands, as **defensive** rather than corrective: it is
+robust against a future re-indent of the workflow, which the `-c` form is not.
+Recorded at length because an AgDR is what someone trusts years later, and a
+confidently-worded false entry in one is worse than no entry.
+
+**The comment policy has a cost, and it is recorded here because
+`SKILL.md` says it is.** Stripping comments before every check means content a
+client *does* render but a linter treats as commented is not checked. Two
+cases: an MSO conditional comment (Outlook renders it), and `<style><!-- ...
+--></style>`, a legacy email idiom where CSS ignores the `<!--` as a CDO token
+and applies the rules between. The second was found as a live suppression -
+`@import`, a third-party font host and `display:flex` all went unreported
+inside one - and is closed by carrying rawtext state, so `<style>` content is
+no longer stripped. The MSO case remains: it is the narrower of the two, and
+the alternative (not stripping) reintroduces the ghost-table false positive
+this file was built to avoid. Stated plainly so nobody has to infer it from a
+diff.
 
 **Mutation coverage was overstated.** The previous round claimed "one negative
 case per check"; a sweep neutering each of 45 emission sites found **24

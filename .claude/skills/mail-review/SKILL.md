@@ -55,12 +55,19 @@ that.
 
 One policy decision worth knowing, because it cuts both ways: **HTML comments
 are stripped before every check**, using a tag-aware scan rather than a
-`<!--.*?-->` search. So commented-out markup raises nothing, and a `<!--` inside
-a quoted attribute value — literal text to every mail client — cannot be used to
-blank a violation out of view. An unterminated `<!--` is reported rather than
-obeyed. The cost is that content inside an MSO conditional comment, which
-Outlook *does* render, is not linted; that is the deliberate trade recorded in
-AgDR-0123.
+`<!--.*?-->` search. So commented-out markup raises nothing, and none of these
+can be used to blank a violation out of view — each was a live suppression
+before it was closed:
+
+- `<!--` inside a quoted attribute value (literal text to every client)
+- `--!>`, which also closes a comment (WHATWG 13.2.5.52)
+- `<!--` inside `<title>`, `<textarea>`, `<style>` or `<script>`, where comment
+  syntax does not apply — `<style><!-- … --></style>` is a real legacy idiom,
+  and CSS applies the rules between those markers
+- an unterminated `<!--`, which is reported rather than obeyed
+
+**The cost:** content inside an MSO conditional comment, which Outlook *does*
+render, is not linted. That trade is recorded in AgDR-0123 § postscript 3.
 
 Read the `skipped` array in the
 output and **report it to the operator verbatim** — a check that did not run

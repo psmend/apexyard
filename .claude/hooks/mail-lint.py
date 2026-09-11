@@ -706,7 +706,7 @@ def _colour_in(value: str) -> tuple[str | None, str | None]:
     function went quiet on `bgcolor="white"`.
     """
     cleaned: list[str] = []
-    saw_url = False
+    saw_paint = False
     i = 0
     while i < len(value):
         m = _FUNC_HEAD.search(value, i)
@@ -726,8 +726,13 @@ def _colour_in(value: str) -> tuple[str | None, str | None]:
         fn = m.group(1).lower()
         if fn in ("rgb", "rgba", "hsl", "hsla"):
             cleaned.append(value[m.start():j + 1])
-        elif fn == "url":
-            saw_url = True
+        else:
+            # url(), linear-gradient(), var(), image-set()... - something is
+            # painted here and we cannot say what colour it is. A gradient is
+            # no more measurable than a photograph; resolving it to its first
+            # stop would be the same guess-reported-as-measurement this whole
+            # function exists to stop.
+            saw_paint = True
         i = j + 1
 
     scan = "".join(cleaned)
@@ -741,7 +746,7 @@ def _colour_in(value: str) -> tuple[str | None, str | None]:
             return got, None
         if unresolved is None and (tok.startswith("#") or "(" in tok or tok.lower() in _NAMED):
             unresolved = tok
-    if unresolved is None and saw_url:
+    if unresolved is None and saw_paint:
         unresolved = "url(...)"
     return None, unresolved
 
@@ -845,6 +850,11 @@ def _comment_spans(text: str) -> tuple[list[tuple[int, int]], list[int]]:
             continue
 
         head = _TAG_HEAD.match(text, lt)
+        # An unbalanced quote inside a tag runs this scan to end-of-document,
+        # so no later comment is found and commented-out markup is linted as
+        # live. That fails toward FALSE POSITIVES, never toward suppression,
+        # which is the direction to fail in - a noisy linter gets fixed, a
+        # quiet one gets trusted.
         j, quote = lt + 1, ""
         while j < n:
             c = text[j]
