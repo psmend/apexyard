@@ -222,7 +222,15 @@ case per check"; a sweep neutering each of 45 emission sites found **24
 survivors**, including `path-escape` (the security fix with zero tests), the
 CTA's measured floor, and the loop registering every universal skip - which is
 to say the *fix for* the skip-loudly finding was itself unverified. The suite
-is now 58 cases.
+is now **60 cases, and a re-run of the same sweep kills all 50 sites** - every
+finding and every skip this file can emit is pinned by at least one test that
+fails without it.
+
+Three rounds of this metric are worth recording together, because the trend is
+the argument for measuring it at all: 12 survivors of 23 sites, then 24 of 45,
+now 0 of 50. Test *count* moved steadily upward the whole time (12 → 29 → 60)
+and said nothing useful; only the sweep distinguished "more tests" from "more
+covered".
 
 The lesson that generalises: **each of these was introduced by a fix.** Review
 caught them because review runs the code against inputs the author did not
