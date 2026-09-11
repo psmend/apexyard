@@ -49,6 +49,7 @@ import os
 import re
 import signal
 import sys
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -103,21 +104,28 @@ def load_config(ops_root: str) -> dict:
         try:
             with open(base, encoding="utf-8") as fh:
                 loaded = json.load(fh)
+            if not isinstance(loaded, dict):
+                raise ValueError("top level is not an object")
             if isinstance(loaded.get("mail_design"), dict):
                 cfg = loaded["mail_design"]
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, ValueError):
             pass  # tolerated: absent or unreadable defaults grant nothing
 
     if os.path.isfile(over):
         try:
             with open(over, encoding="utf-8") as fh:
                 loaded = json.load(fh)
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ConfigError(
                 f"{over} exists but could not be read: {exc}. Refusing to fall back to "
                 "framework defaults - that would silently drop your brand rules and "
                 "report a pass it did not earn. Fix the file, or remove it."
             ) from exc
+        if not isinstance(loaded, dict):
+            raise ConfigError(
+                f"{over} parses as JSON but its top level is {type(loaded).__name__}, not an "
+                "object. Refusing to fall back to defaults - see above."
+            )
         if isinstance(loaded.get("mail_design"), dict):
             cfg = loaded["mail_design"]  # shallow: the override replaces wholesale
     return cfg
@@ -183,8 +191,14 @@ class Finding:
     line: int = 0
 
     def render(self) -> str:
-        where = f"{self.path}:{self.line}" if self.line else self.path
-        return f"  [{self.severity.upper():5}] {self.rule:28} {where}\n           {self.message}"
+        # A newline in a path or an echoed capture would put the next line at
+        # column 0 of the CI step's stdout, which is where GitHub Actions looks
+        # for ::workflow-commands::. Keep every finding on the lines we chose.
+        def _flat(s: str) -> str:
+            return re.sub(r"[\r\n\x00-\x08\x0b\x0c\x0e-\x1f]", "\u2423", str(s))
+
+        where = f"{_flat(self.path)}:{self.line}" if self.line else _flat(self.path)
+        return f"  [{self.severity.upper():5}] {self.rule:28} {where}\n           {_flat(self.message)}"
 
 
 @dataclass
@@ -217,7 +231,9 @@ REGEX_INPUT_CAP = 200_000
 MAX_TEMPLATE_BYTES = 2_000_000
 
 
-REGEX_TIMEOUT_SECONDS = 5
+# Env-overridable so the regression test can pin the guard without paying the
+# full ceiling in wall-clock. The guard itself is not optional.
+REGEX_TIMEOUT_SECONDS = max(1, int(os.environ.get("MAIL_LINT_REGEX_TIMEOUT") or 5))
 
 
 class _RegexTimeout(Exception):
@@ -239,7 +255,11 @@ def _time_limit(seconds: int):
     refuses to start on an unusual platform is worse than one that can be hung
     by a config the adopter wrote themselves.
     """
-    if not hasattr(signal, "SIGALRM"):
+    # `hasattr(signal, "SIGALRM")` is a PLATFORM test, and the promise above is
+    # about availability. Off the main thread signal.signal raises ValueError,
+    # which _run_guarded does not catch - so the docstring's "degrades to
+    # nothing" was not true of the most likely way to reach it.
+    if not hasattr(signal, "SIGALRM") or threading.current_thread() is not threading.main_thread():
         yield
         return
 
@@ -247,12 +267,18 @@ def _time_limit(seconds: int):
         raise _RegexTimeout()
 
     previous = signal.signal(signal.SIGALRM, _fire)
-    signal.alarm(seconds)
+    # Whatever the caller had armed, minus what we are about to spend. An
+    # unconditional alarm(0) in the finally silently cancelled an outer
+    # watchdog - fine for the CLI, very hard to debug in-process.
+    outer = signal.alarm(seconds)
     try:
         yield
     finally:
-        signal.alarm(0)
+        spent = signal.alarm(0)
         signal.signal(signal.SIGALRM, previous)
+        if outer:
+            remaining = outer - (seconds - spent) if spent else outer - seconds
+            signal.alarm(max(1, remaining))
 
 
 def _run_guarded(rx, text: str, where: str, path: str, rep: Report, finder="finditer"):
@@ -277,7 +303,7 @@ def _safe_compile(pattern: str, where: str, path: str, rep: Report):
     """Compile config-supplied regex, reporting rather than crashing."""
     try:
         return re.compile(pattern)
-    except re.error as exc:
+    except (re.error, RecursionError) as exc:
         rep.add(
             "error",
             "config",
@@ -372,6 +398,10 @@ def check_universal(text: str, path: str, uni: dict, rep: Report) -> None:
             return_early_style = True
         else:
             return_early_style = False
+        # The empty-list arm is a `continue` for a loop that has no `continue`:
+        # the unclosed-<style> branch above has already reported, and running the
+        # `.*?` scan anyway is the 47-second path it exists to avoid. Written as
+        # a conditional iterable so the reporting and the skip stay adjacent.
         for m in ([] if return_early_style else re.finditer(r"<style\b[^>]*>(.*?)</style\s*>", text, re.I | re.S)):
             body = re.sub(r"@font-face\s*\{[^}]*\}", "", m.group(1), flags=re.I | re.S)
             if body.strip():
@@ -515,17 +545,155 @@ def check_fonts(text: str, path: str, cfg: dict, rep: Report) -> None:
 TAG_RE = re.compile(r"<(/?)([a-zA-Z][\w-]*)\b([^>]*)>", re.S)
 VOID_TAGS = {"img", "br", "hr", "meta", "link", "input", "source", "area",
              "base", "col", "embed", "param", "track", "wbr"}
-_HEX = r"#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})"
-BG_RE = re.compile(rf"background(?:-color)?\s*:\s*({_HEX})", re.I)
-FG_RE = re.compile(rf"(?<!-)\bcolor\s*:\s*({_HEX})", re.I)
+# CSS named colours. Reading only hex made the contrast layer blind to
+# `bgcolor="white"` - the single most common ground spelling in hand-written
+# email - and a 1.03:1 body reported clean while the report still claimed the
+# contrast check had run. A colour grammar the linter cannot read is worse
+# than one it rejects, because the first is silent.
+_NAMED = {
+    "aliceblue": "#f0f8ff", "antiquewhite": "#faebd7", "aqua": "#00ffff",
+    "aquamarine": "#7fffd4", "azure": "#f0ffff", "beige": "#f5f5dc",
+    "bisque": "#ffe4c4", "black": "#000000", "blanchedalmond": "#ffebcd",
+    "blue": "#0000ff", "blueviolet": "#8a2be2", "brown": "#a52a2a",
+    "burlywood": "#deb887", "cadetblue": "#5f9ea0", "chartreuse": "#7fff00",
+    "chocolate": "#d2691e", "coral": "#ff7f50", "cornflowerblue": "#6495ed",
+    "cornsilk": "#fff8dc", "crimson": "#dc143c", "cyan": "#00ffff",
+    "darkblue": "#00008b", "darkcyan": "#008b8b", "darkgoldenrod": "#b8860b",
+    "darkgray": "#a9a9a9", "darkgrey": "#a9a9a9", "darkgreen": "#006400",
+    "darkkhaki": "#bdb76b", "darkmagenta": "#8b008b", "darkolivegreen": "#556b2f",
+    "darkorange": "#ff8c00", "darkorchid": "#9932cc", "darkred": "#8b0000",
+    "darksalmon": "#e9967a", "darkseagreen": "#8fbc8f", "darkslateblue": "#483d8b",
+    "darkslategray": "#2f4f4f", "darkslategrey": "#2f4f4f", "darkturquoise": "#00ced1",
+    "darkviolet": "#9400d3", "deeppink": "#ff1493", "deepskyblue": "#00bfff",
+    "dimgray": "#696969", "dimgrey": "#696969", "dodgerblue": "#1e90ff",
+    "firebrick": "#b22222", "floralwhite": "#fffaf0", "forestgreen": "#228b22",
+    "fuchsia": "#ff00ff", "gainsboro": "#dcdcdc", "ghostwhite": "#f8f8ff",
+    "gold": "#ffd700", "goldenrod": "#daa520", "gray": "#808080",
+    "grey": "#808080", "green": "#008000", "greenyellow": "#adff2f",
+    "honeydew": "#f0fff0", "hotpink": "#ff69b4", "indianred": "#cd5c5c",
+    "indigo": "#4b0082", "ivory": "#fffff0", "khaki": "#f0e68c",
+    "lavender": "#e6e6fa", "lavenderblush": "#fff0f5", "lawngreen": "#7cfc00",
+    "lemonchiffon": "#fffacd", "lightblue": "#add8e6", "lightcoral": "#f08080",
+    "lightcyan": "#e0ffff", "lightgoldenrodyellow": "#fafad2", "lightgray": "#d3d3d3",
+    "lightgrey": "#d3d3d3", "lightgreen": "#90ee90", "lightpink": "#ffb6c1",
+    "lightsalmon": "#ffa07a", "lightseagreen": "#20b2aa", "lightskyblue": "#87cefa",
+    "lightslategray": "#778899", "lightslategrey": "#778899", "lightsteelblue": "#b0c4de",
+    "lightyellow": "#ffffe0", "lime": "#00ff00", "limegreen": "#32cd32",
+    "linen": "#faf0e6", "magenta": "#ff00ff", "maroon": "#800000",
+    "mediumaquamarine": "#66cdaa", "mediumblue": "#0000cd", "mediumorchid": "#ba55d3",
+    "mediumpurple": "#9370db", "mediumseagreen": "#3cb371", "mediumslateblue": "#7b68ee",
+    "mediumspringgreen": "#00fa9a", "mediumturquoise": "#48d1cc",
+    "mediumvioletred": "#c71585", "midnightblue": "#191970", "mintcream": "#f5fffa",
+    "mistyrose": "#ffe4e1", "moccasin": "#ffe4b5", "navajowhite": "#ffdead",
+    "navy": "#000080", "oldlace": "#fdf5e6", "olive": "#808000",
+    "olivedrab": "#6b8e23", "orange": "#ffa500", "orangered": "#ff4500",
+    "orchid": "#da70d6", "palegoldenrod": "#eee8aa", "palegreen": "#98fb98",
+    "paleturquoise": "#afeeee", "palevioletred": "#db7093", "papayawhip": "#ffefd5",
+    "peachpuff": "#ffdab9", "peru": "#cd853f", "pink": "#ffc0cb",
+    "plum": "#dda0dd", "powderblue": "#b0e0e6", "purple": "#800080",
+    "rebeccapurple": "#663399", "red": "#ff0000", "rosybrown": "#bc8f8f",
+    "royalblue": "#4169e1", "saddlebrown": "#8b4513", "salmon": "#fa8072",
+    "sandybrown": "#f4a460", "seagreen": "#2e8b57", "seashell": "#fff5ee",
+    "sienna": "#a0522d", "silver": "#c0c0c0", "skyblue": "#87ceeb",
+    "slateblue": "#6a5acd", "slategray": "#708090", "slategrey": "#708090",
+    "snow": "#fffafa", "springgreen": "#00ff7f", "steelblue": "#4682b4",
+    "tan": "#d2b48c", "teal": "#008080", "thistle": "#d8bfd8",
+    "tomato": "#ff6347", "turquoise": "#40e0d0", "violet": "#ee82ee",
+    "wheat": "#f5deb3", "white": "#ffffff", "whitesmoke": "#f5f5f5",
+    "yellow": "#ffff00", "yellowgreen": "#9acd32",
+}
+
+# Values that legitimately declare no colour of their own - the element simply
+# sits on whatever its ancestor provides. These must resolve to "nothing here",
+# never to an unresolved-colour finding.
+_NO_COLOUR = {"transparent", "inherit", "initial", "unset", "none", "currentcolor", "auto"}
+
+_COLOUR_TOKEN = re.compile(r"#[0-9a-fA-F]+|(?:rgba?|hsla?)\s*\([^)]*\)|[a-zA-Z][a-zA-Z]{2,24}", re.I)
+
+
+def _resolve_colour(tok: str) -> str | None:
+    """One colour token -> #rrggbb, or None if it is not a colour we can trust."""
+    t = tok.strip().lower()
+    if t.startswith("#"):
+        # Length is the whole point. `#12345` used to normalise to `#112233` -
+        # a colour appearing nowhere in the document - and `#ff0000ff` had its
+        # alpha silently dropped, both then reported as MEASURED ratios.
+        return _norm_hex(t) if len(t) in (4, 7) else None
+    if t in _NAMED:
+        return _NAMED[t]
+    m = re.match(r"(rgba?|hsla?)\s*\(([^)]*)\)", t)
+    if m:
+        fn, body = m.group(1), m.group(2)
+        parts = [p.strip() for p in body.replace("/", ",").split(",") if p.strip()]
+        if len(parts) == 1:
+            parts = body.split()
+        if len(parts) < 3:
+            return None
+        # A colour with an alpha channel is NOT a colour you can measure a
+        # contrast ratio against - what renders depends on the backdrop. The
+        # alpha check already names these; resolving them to their opaque
+        # component would hand back a fabricated "measured" number.
+        if len(parts) > 3:
+            return None
+        try:
+            if fn.startswith("rgb"):
+                vals = [round(float(p[:-1]) * 255 / 100) if p.endswith("%") else int(float(p))
+                        for p in parts]
+                if not all(0 <= v <= 255 for v in vals):
+                    return None
+                return "#%02x%02x%02x" % tuple(vals)
+            h = float(re.sub(r"deg$", "", parts[0])) % 360 / 360
+            s = float(parts[1].rstrip("%")) / 100
+            ll = float(parts[2].rstrip("%")) / 100
+            if not (0 <= s <= 1 and 0 <= ll <= 1):
+                return None
+            import colorsys
+            r, g, b = colorsys.hls_to_rgb(h, ll, s)
+            return "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
+        except ValueError:
+            return None
+    return None
+
+
+def _colour_in(value: str) -> tuple[str | None, str | None]:
+    """
+    First trustworthy colour in a declaration value, plus the first token that
+    looked like a colour and was NOT trustworthy.
+
+    Returning the unresolved token matters as much as returning the colour:
+    dropping it silently is how `bgcolor="white"` became invisible.
+    `background: url(hero.png) #FFFDF9` is why this scans the whole value
+    rather than only the first token after the colon.
+    """
+    unresolved = None
+    for m in _COLOUR_TOKEN.finditer(value):
+        tok = m.group(0)
+        if tok.strip().lower() in _NO_COLOUR:
+            continue
+        got = _resolve_colour(tok)
+        if got:
+            return got, None
+        if unresolved is None and (tok.startswith("#") or "(" in tok or tok.lower() in _NAMED):
+            unresolved = tok
+    return None, unresolved
+
+
+_VALUE = r"([^;\"']+)"
+BG_RE = re.compile(rf"background(?:-color)?\s*:\s*{_VALUE}", re.I)
+FG_RE = re.compile(rf"(?<!-)\bcolor\s*:\s*{_VALUE}", re.I)
 # The PRESENTATIONAL attribute forms. `bgcolor="#FFFDF9"` is the attribute
 # Outlook actually honours and the one every email framework emits, so reading
 # only the CSS form made the linter blind on the most common authoring style -
 # it missed a 1.6:1 body and a CTA on the wrong band, AND raised a false
 # "no signature band" on a template whose band was right there. Failing in both
 # directions at once is the worst thing a linter can do.
-BG_ATTR_RE = re.compile(rf"\bbgcolor\s*=\s*[\"\']?({_HEX})", re.I)
-FG_ATTR_RE = re.compile(rf"<font\b[^>]*\bcolor\s*=\s*[\"\']?({_HEX})", re.I)
+BG_ATTR_RE = re.compile(r"\bbgcolor\s*=\s*(?:\"([^\"]*)\"|\'([^\']*)\'|([^\s>]+))", re.I)
+FG_ATTR_RE = re.compile(r"<font\b[^>]*?\bcolor\s*=\s*(?:\"([^\"]*)\"|\'([^\']*)\'|([^\s>]+))", re.I)
+
+
+def _attr_value(m: re.Match) -> str:
+    """First non-empty group of the quoted/unquoted attribute alternation."""
+    return next((g for g in m.groups() if g is not None), "")
 
 
 @dataclass
@@ -537,11 +705,65 @@ class Element:
     own_bg: str | None
     parent_ground: str | None   # what the ELEMENT sits on, ignoring its own background
     cell_depth: int             # background-carrying td/th ancestors - see _bands()
+    unresolved: tuple[str, ...] = ()   # colour values declared here but not readable
+
+
+def _comment_spans(text: str) -> tuple[list[tuple[int, int]], list[int]]:
+    """
+    Find the spans a mail client would treat as comments - and only those.
+
+    The naive `<!--.*?-->` this replaced could be opened from inside a quoted
+    attribute value, where `<!--` is literal text to every real client. That
+    let an author blank arbitrary markup out of the linter's view and ship a
+    1.12:1 body with the gate green - the "quietly switch the gate off"
+    failure this module exists to prevent. So the scan walks tags properly and
+    only opens a comment at document level.
+
+    Returns the spans plus the offsets of any unterminated `<!--`. An
+    unterminated opener is NOT treated as a comment: doing so would swallow
+    the rest of the document and hand back the same suppression primitive
+    through a shorter door. The caller reports it instead.
+    """
+    spans: list[tuple[int, int]] = []
+    unterminated: list[int] = []
+    i, n = 0, len(text)
+    while i < n:
+        lt = text.find("<", i)
+        if lt < 0:
+            break
+        if text.startswith("<!--", lt):
+            end = text.find("-->", lt + 4)
+            if end < 0:
+                unterminated.append(lt)
+                break
+            spans.append((lt, end + 3))
+            i = end + 3
+            continue
+        nxt = text[lt + 1] if lt + 1 < n else ""
+        if not (nxt.isalpha() or nxt in "/!?"):
+            # A bare `<` in prose. Not a tag; stepping over it keeps a later
+            # real comment visible.
+            i = lt + 1
+            continue
+        j, quote = lt + 1, ""
+        while j < n:
+            c = text[j]
+            if quote:
+                if c == quote:
+                    quote = ""
+            elif c in "\"'":
+                quote = c
+            elif c == ">":
+                break
+            j += 1
+        i = j + 1
+    return spans, unterminated
 
 
 def _strip_comments(text: str) -> str:
     """
-    Blank out HTML comments, preserving offsets so line numbers stay true.
+    Blank out HTML comments, preserving both offsets and line breaks so
+    reported line numbers stay true through a multi-line comment.
 
     The MSO ghost-table idiom is deliberately unbalanced across two
     comments and is standard production email:
@@ -555,11 +777,19 @@ def _strip_comments(text: str) -> str:
     positive that fails CI on a correct, industry-standard template. That is
     the outcome this module's own docstring calls fatal.
     """
-    return re.sub(r"<!--.*?-->", lambda m: " " * len(m.group(0)), text, flags=re.S)
+    spans, _ = _comment_spans(text)
+    if not spans:
+        return text
+    out = list(text)
+    for a, b in spans:
+        for k in range(a, b):
+            if out[k] != "\n":
+                out[k] = " "
+    return "".join(out)
 
 
 @lru_cache(maxsize=4)
-def parse_elements(text: str) -> list[Element]:
+def parse_elements(text: str) -> tuple[Element, ...]:
     """
     Walk the document maintaining a tag stack, so every colour is resolved
     against the background it *actually* sits on.
@@ -572,7 +802,13 @@ def parse_elements(text: str) -> list[Element]:
     disbelieve stops being a gate. The stack is what makes the contrast numbers
     trustworthy.
     """
-    stack: list[tuple[str, str | None]] = []
+    # Each frame carries the CUMULATIVE inherited ground and cell depth at that
+    # point, so neither has to be recomputed by walking the stack on every tag.
+    # Recomputing made the walk quadratic in nesting depth - 40,000 unclosed
+    # <span>s (240 KB, well inside the size cap) took 17s, and the curve puts a
+    # 2 MB file in the tens of minutes. Truncating the stack restores the outer
+    # values for free, because each frame stores its own.
+    stack: list[tuple[str, str | None, str | None, int]] = []
     out: list[Element] = []
     text = _strip_comments(text)
 
@@ -588,22 +824,46 @@ def parse_elements(text: str) -> list[Element]:
 
         style = _style_of(m.group(0))
         whole = m.group(0)
-        own_bg_m = BG_RE.search(style) or BG_ATTR_RE.search(whole)
-        own_bg = _norm_hex(own_bg_m.group(1)) if own_bg_m else None
-        fg_m = FG_RE.search(style) or FG_ATTR_RE.search(whole)
-        fg = _norm_hex(fg_m.group(1)) if fg_m else None
+        bad: list[str] = []
 
-        inherited = next((bg for _, bg in reversed(stack) if bg), None)
-        cell_depth = sum(1 for n, bg in stack if bg and n in ("td", "th"))
+        sm = BG_RE.search(style)
+        if sm:
+            own_bg, bad_bg = _colour_in(sm.group(1))
+        else:
+            am = BG_ATTR_RE.search(whole)
+            own_bg, bad_bg = _colour_in(_attr_value(am)) if am else (None, None)
+        if bad_bg:
+            bad.append(bad_bg)
 
-        if fg or own_bg:
+        sm = FG_RE.search(style)
+        if sm:
+            fg, bad_fg = _colour_in(sm.group(1))
+        else:
+            am = FG_ATTR_RE.search(whole)
+            fg, bad_fg = _colour_in(_attr_value(am)) if am else (None, None)
+        if bad_fg:
+            bad.append(bad_fg)
+
+        inherited = stack[-1][2] if stack else None
+        cell_depth = stack[-1][3] if stack else 0
+
+        # An element carrying ONLY an unreadable colour is still recorded, so
+        # the run can say so. Dropping it is what made the blindness silent.
+        if fg or own_bg or bad:
             out.append(Element(m.start(), name, fg, own_bg or inherited,
-                               own_bg, inherited, cell_depth))
+                               own_bg, inherited, cell_depth, tuple(bad)))
 
         if name not in VOID_TAGS and not attrs.rstrip().endswith("/"):
-            stack.append((name, own_bg))
+            stack.append((
+                name,
+                own_bg,
+                own_bg or inherited,
+                cell_depth + (1 if own_bg and name in ("td", "th") else 0),
+            ))
 
-    return out
+    # A tuple, because this is memoised: returning the list handed every caller
+    # the same mutable object, and one append would have poisoned the cache.
+    return tuple(out)
 
 
 def _bands(text: str) -> list[tuple[int, str, str]]:
@@ -634,10 +894,30 @@ def check_contrast(text: str, path: str, cfg: dict, rep: Report) -> None:
         (e.get("fg", "").lower(), e.get("bg", "").lower())
         for e in (con.get("accepted_exceptions") or [])
     }
-    rep.checked.append("contrast")
+    # Claiming the check ran is a claim that something was measured. It used to
+    # be appended unconditionally, so a template whose every colour was written
+    # in a spelling the linter could not read reported `contrast` among the
+    # checks run and `clean` as the verdict. Count the comparisons instead.
+    measured = 0
+    seen_bad: set[str] = set()
     for el in parse_elements(text):
+        for raw in el.unresolved:
+            if raw in seen_bad:
+                continue
+            seen_bad.add(raw)
+            rep.add(
+                "error",
+                "unreadable-colour",
+                f"`{raw}` is declared as a colour but cannot be read, so nothing here "
+                f"was measured against it. Hex must be 3 or 6 digits (8-digit RGBA "
+                f"carries an alpha this cannot measure); use a named colour, `rgb()` "
+                f"or `hsl()` otherwise.",
+                path,
+                line_of(text, el.offset),
+            )
         if not el.fg or not el.ground:
             continue
+        measured += 1
         if (el.fg, el.ground) in exceptions:
             continue
         ratio = contrast(el.fg, el.ground)
@@ -650,6 +930,12 @@ def check_contrast(text: str, path: str, cfg: dict, rep: Report) -> None:
                 path,
                 line_of(text, el.offset),
             )
+
+    if measured:
+        rep.checked.append("contrast")
+    else:
+        rep.skip("contrast", "no readable text/ground colour pair in this template - "
+                             "nothing was measured, so this says nothing about it")
 
 
 def check_cta(text: str, path: str, cfg: dict, rep: Report) -> None:
@@ -747,11 +1033,28 @@ def check_family(text: str, path: str, cfg: dict, family: str, rep: Report) -> N
         #
         # A photograph in this layout is full-bleed; a logo is not. Width is the
         # discriminator that actually separates them.
+        # `\d+` alone read `100` out of `width="100%"` - the spelling every ESP
+        # emits for a full-bleed hero - and failed CI on a correct template at
+        # ERROR severity. A percentage says nothing about pixels, so fall back
+        # to the style width, and when NOTHING resolves to pixels, skip rather
+        # than accuse: an unmeasurable template is not a failing one.
         min_w = int(spec.get("photo_min_width") or 400)
-        widths = [
-            int(w) for w in re.findall(r"<img\b[^>]*\bwidth\s*=\s*[\"\']?(\d+)", text, re.I)
-        ]
-        if not any(w >= min_w for w in widths):
+        widths: list[int] = []
+        percent_only = False
+        for tag in re.findall(r"<img\b[^>]*>", text, re.I):
+            m = re.search(r"\bwidth\s*:\s*(\d+(?:\.\d+)?)px", tag, re.I)
+            if not m:
+                m = re.search(r"\bwidth\s*=\s*[\"\']?(\d+(?:\.\d+)?)(?![\d.]*%)", tag, re.I)
+            if m:
+                widths.append(int(float(m.group(1))))
+            elif re.search(r"\bwidth\s*=\s*[\"\']?[\d.]+%", tag, re.I):
+                percent_only = True
+
+        if not widths and percent_only:
+            rep.skip("family-photo", "every image is sized in percentages, so no pixel "
+                                     "width could be resolved - the photograph rule was "
+                                     "not applied to this template")
+        elif not any(w >= min_w for w in widths):
             rep.add(
                 "error",
                 "family",
@@ -859,9 +1162,27 @@ def lint_file(path: str, cfg: dict, family: str, rep: Report) -> None:
             return
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         rep.add("error", "unreadable", f"Could not read: {exc}", path, 0)
         return
+    # One notion of "what is a comment", applied everywhere. Previously only
+    # parse_elements stripped, so markup a client would never execute still
+    # raised ERROR-severity findings from the universal checks - the mirror of
+    # the suppression bug, and the same root cause: two answers to one question.
+    _, unterminated = _comment_spans(text)
+    for off in unterminated:
+        rep.add(
+            "error",
+            "unterminated-comment",
+            "`<!--` is never closed. A mail client swallows the rest of the document "
+            "from here, so nothing below it renders - and the linter will not treat it "
+            "as a comment, because doing so would let an unclosed opener blank the "
+            "template out of view. Close it.",
+            path,
+            line_of(text, off),
+        )
+    text = _strip_comments(text)
+
     parse_elements.cache_clear()  # per-file memo; see parse_elements
     check_universal(text, path, cfg.get("universal") or {}, rep)
     check_palette(text, path, cfg, rep)
@@ -908,8 +1229,16 @@ def resolve_targets(args_paths: list[str], cfg: dict, root: str, rep: Report) ->
         for p in args_paths:
             raw.extend(sorted(glob.glob(p, recursive=True)) if any(c in p for c in "*?[") else [p])
     else:
+        # --require-match only catches TOTAL drift: every glob dead. Adopters
+        # accumulate globs over time, so the likelier shape is one live glob and
+        # two stale ones - and that exited 0 with nothing said, leaving whole
+        # directories silently unlinted. Name the dead ones individually.
         for pattern in cfg.get("template_globs") or []:
-            raw.extend(sorted(glob.glob(os.path.join(root, pattern), recursive=True)))
+            hits = sorted(glob.glob(os.path.join(root, pattern), recursive=True))
+            if not hits:
+                rep.skip(f"glob:{pattern}", f"template glob `{pattern}` matched no files - "
+                                            "nothing under it was checked")
+            raw.extend(hits)
 
     out: list[str] = []
     for p in raw:

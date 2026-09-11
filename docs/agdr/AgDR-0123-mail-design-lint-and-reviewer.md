@@ -90,7 +90,11 @@ when this fails.
   with **exit 2**, kept distinct from exit 1 so "your config is wrong" never
   looks like "your templates are wrong". CI passes `--require-match`, because a
   job that only runs on template changes finding no templates means the globs
-  and the workflow's `paths:` filter have drifted apart.
+  and the workflow's `paths:` filter have drifted apart. That flag only catches
+  **total** drift, though, and the likelier shape is partial - adopters
+  accumulate globs, so one live glob and two stale ones exited 0 with nothing
+  said and whole directories silently unlinted. Each glob matching no files is
+  now named individually in SKIPPED.
 - The `paths:` filter in the workflow duplicates `mail_design.template_globs`.
   Two places to keep in sync; GitHub Actions cannot read the JSON to build its
   own trigger.
@@ -169,6 +173,61 @@ because a photograph in this layout is full-bleed and a logo is not.
 The pattern across all six: **self-review verified the code did what I meant;
 review verified it did what it claimed.** The gap between those two is where
 every one of these lived.
+
+## Postscript 3 - the colour grammar, and a gate with a switch on it
+
+A third review round found five more, and the pattern is sharper than in
+postscript 2. Every one lived in code written to *fix* an earlier finding.
+
+**The linter could be switched off from inside a template.** Comments were
+found with `<!--.*?-->`. A `<!--` inside a quoted attribute value is literal
+text to every mail client, but that search reads it as a comment opener and
+blanks everything to the next `-->` - out of the contrast, CTA and band checks
+alike. A body at 1.12:1, invisible to the reader, reported `clean`. The
+stripping had been added for the MSO ghost-table false positive, which is a
+real and standard idiom; the mistake was reaching for a regex to answer a
+question about document structure. It is now a tag-aware scan, an unterminated
+`<!--` is reported rather than obeyed (honouring it would hand the same
+primitive back through a shorter door), and the scan is applied **once in
+`lint_file`** so every check shares one definition. Before that it was applied
+in exactly one place, so the same run held two opinions: `parse_elements`
+stripped and the universal checks did not, and genuinely dead markup produced
+ERROR-severity false positives. One root cause, wrong in both directions.
+
+**The contrast layer read hex and nothing else.** `bgcolor="white"` - the most
+common ground spelling in hand-written email - was invisible, so a 1.03:1 body
+reported clean *while the report listed `contrast` among the checks that ran*.
+Same for `rgb()`, `hsl()`, and any colour not sitting immediately after the
+colon. The second half was worse: the pattern lacked the word boundary its
+sibling had been given, so `#12345` normalised to `#112233` - a colour
+appearing nowhere in the document - and `#ff0000ff` had its alpha silently
+dropped, both then reported as *measured* ratios against real line numbers.
+There is now one resolver for hex-3/6, the named table, `rgb()` and `hsl()`;
+anything else becomes an `unreadable-colour` finding instead of a silent drop;
+and `contrast` is only claimed as run when a comparison actually happened.
+
+**The photograph rule failed CI on correct templates.** `\d+` read `100` out of
+`width="100%"` - the spelling every ESP emits for a full-bleed hero. The MSO
+fix and the photo fix shipped in the same commit, one removing an
+ERROR-severity false positive and the other introducing one.
+
+**The CI summary step failed on every healthy run.** Its two `python3 -c`
+programs were indented to sit inside the YAML block, and `-c` does not strip a
+common indent - `IndentationError` on line 2, under `set -e`, on any run that
+produced a report. The step written to prevent silence about unrun checks
+would have blocked every clean merge through the red-CI gate. Heredocs now.
+
+**Mutation coverage was overstated.** The previous round claimed "one negative
+case per check"; a sweep neutering each of 45 emission sites found **24
+survivors**, including `path-escape` (the security fix with zero tests), the
+CTA's measured floor, and the loop registering every universal skip - which is
+to say the *fix for* the skip-loudly finding was itself unverified. The suite
+is now 58 cases.
+
+The lesson that generalises: **each of these was introduced by a fix.** Review
+caught them because review runs the code against inputs the author did not
+imagine. The three fixes in postscript 2 were verified the same way and held;
+these five were not, and did not.
 
 ---
 

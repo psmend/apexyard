@@ -43,9 +43,24 @@ python3 .claude/hooks/mail-lint.py [paths...] [--family <name>] --json
 ```
 
 Exit **0** clean, **1** findings at `error` severity, **2** the config itself is
-broken (unparseable override, missing `mail_design`, empty `template_globs`, or
-`--require-match` with nothing matched). Exit 2 is deliberately distinct: "your
-config is wrong" must never look like "your templates are wrong."
+broken (unparseable override, a top level that is not a JSON object, missing
+`mail_design`, empty `template_globs`, or `--require-match` with nothing
+matched). Exit 2 is deliberately distinct: "your config is wrong" must never
+look like "your templates are wrong."
+
+**On exit 2 `--json` writes nothing to stdout** — the error goes to stderr. A
+consumer that pipes stdout into a JSON parser gets a parse error, not an error
+object, so check the exit code before parsing. The CI template does exactly
+that.
+
+One policy decision worth knowing, because it cuts both ways: **HTML comments
+are stripped before every check**, using a tag-aware scan rather than a
+`<!--.*?-->` search. So commented-out markup raises nothing, and a `<!--` inside
+a quoted attribute value — literal text to every mail client — cannot be used to
+blank a violation out of view. An unterminated `<!--` is reported rather than
+obeyed. The cost is that content inside an MSO conditional comment, which
+Outlook *does* render, is not linted; that is the deliberate trade recorded in
+AgDR-0123.
 
 Read the `skipped` array in the
 output and **report it to the operator verbatim** — a check that did not run

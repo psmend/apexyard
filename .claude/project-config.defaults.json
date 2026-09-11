@@ -26,7 +26,7 @@
       "stacks": []
     },
     "families": {
-      "_comment": "Named families, each with a signature_ground hex. The family is detected from that hex appearing as a band ground, or forced with --family."
+      "_comment": "Named families, each with a signature_ground hex. The family is detected from that hex appearing as a band ground, or forced with --family. Per-family keys: signature_ground (hex, required), max_signature_bands (int, default 1), requires_photo (bool - satisfied by an image at least photo_min_width px wide, NOT by the header logo), photo_min_width (int, default 400), allows_unsubscribe (bool - false makes an unsubscribe link an error, which is what keeps a clinical mail off the marketing consent gate)."
     },
     "cta": {
       "_comment": "fill is the action colour. Its contrast against the ground it sits on is ALWAYS measured against contrast.non_text_min; allowed_grounds is an additional, optional allowlist.",

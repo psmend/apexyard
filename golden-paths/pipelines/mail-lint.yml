@@ -98,17 +98,26 @@ jobs:
               head -20 /tmp/mail-lint.err 2>/dev/null || echo "(no stderr captured)"
               echo '```'
             else
-              skipped=$(python3 -c "
-          import json
-          d = json.load(open('/tmp/mail-lint.json'))
-          for s in d.get('skipped', []):
-              print('- ' + s)
-          ")
-              ran=$(python3 -c "
-          import json
-          d = json.load(open('/tmp/mail-lint.json'))
-          print(len(d.get('checks_run', [])))
-          ")
+              # Heredoc, not `python3 -c`. Every line of a -c program here is
+              # indented to sit inside the YAML block, and Python does not strip
+              # a common indent from -c - it raises IndentationError on line 2.
+              # Under `set -e` that failed the step on every run that produced a
+              # report, i.e. the HEALTHY path, red-lighting the job that
+              # block-merge-on-red-ci.sh reads. The step written to prevent
+              # silence about unrun checks would have blocked every clean merge.
+              skipped=$(python3 - <<'PY'
+import json
+d = json.load(open('/tmp/mail-lint.json'))
+for s in d.get('skipped', []):
+    print('- ' + s)
+PY
+              )
+              ran=$(python3 - <<'PY'
+import json
+d = json.load(open('/tmp/mail-lint.json'))
+print(len(d.get('checks_run', [])))
+PY
+              )
               echo "$ran check(s) ran."
               if [ -n "$skipped" ]; then
                 echo ""
