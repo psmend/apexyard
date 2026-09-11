@@ -1,0 +1,122 @@
+---
+id: AgDR-0123
+timestamp: 2026-09-11T11:00:00Z
+agent: claude
+model: claude-opus-5
+trigger: user-prompt
+status: accepted
+---
+
+# Email templates get a deterministic linter plus an advisory reviewer, and the gate runs in CI rather than as a merge hook
+
+> In the context of adding email-template review to the framework - a surface
+> whose content typically lives in a database column or a third-party editor
+> rather than in the repo, with no build step and no code review on the way in -
+> facing a choice between one agent that reviews templates end to end and a
+> split between a script and an agent, I decided to **split the work by
+> decidability**: a deterministic Python linter owns every rule with a right
+> answer, an advisory agent (Barid) owns everything requiring judgement, and the
+> **gate is a CI job rather than a `PreToolUse` merge hook** - accepting that a
+> local `gh pr merge` is no longer the enforcement point, in exchange for a gate
+> that also catches a human merging in the GitHub UI and that adds no new
+> trust-chain surface.
+
+## Context
+
+The operator asked for "an agent, a skill" that builds and audits all mail
+designs, living in apexyard so it serves any adopter rather than one project.
+Two design questions had to be answered before writing anything.
+
+**What should an agent actually do here?** Email has an unusually large set of
+mechanical rules: `rgba()` is unsupported in Outlook, an `<img>` without `alt`
+is unreadable when images are blocked, a brand webfont with no fallback renders
+as Times in Gmail, a button fill below 3:1 against its own band has no visible
+edge. Each is *decidable*. A language model asked to check thirty such rules
+across twenty templates will get most of them right - which is the worst
+available outcome, because nobody can tell which ones.
+
+**Where does the gate live?** The operator ruled: lint gates, judgement advises.
+
+## Options considered
+
+| Option | Pros | Cons |
+|---|---|---|
+| One agent reviews templates end to end | Simplest to build; one prompt | Unreliable exactly where reliability is the whole point. No way to tell a missed `rgba()` from an absent one |
+| Linter + agent, gate as a `PreToolUse` hook on `gh pr merge` | Matches the existing merge-gate family; blocks in-session merges | Only fires when the merge goes through Claude Code - a human merging in the GitHub UI bypasses it. Needs to re-fetch each changed template from the forge at PR HEAD, because the local tree is usually not the PR branch. Adds a hook and a `settings.json` matcher, both trust-chain surfaces needing a security pass |
+| **Linter + agent, gate as a CI job** | The existing `block-merge-on-red-ci.sh` turns a red check into a merge gate for free, covering both merge shapes. Catches UI merges. Author sees the finding on push, not at merge. **No new trust-chain surface** | The lint no longer blocks at the local merge call itself; it blocks one step earlier, via CI |
+
+## Decision
+
+Chosen: **linter + advisory agent, gated in CI.**
+
+- `.claude/hooks/_lib-mail-lint.py` - the deterministic pass. Two tiers:
+  **universal** rules (true of HTML email regardless of brand) ship ON, so a
+  fresh adopter gets value with zero config; **brand** rules (palette, font
+  fallbacks, families, CTA grounds) ship EMPTY and **skip loudly** rather than
+  guessing a house style. Config at `mail_design` in
+  `project-config.defaults.json`, overridable per adopter.
+- `.claude/agents/mail-reviewer.md` - Barid. Judgement only, with the lint
+  output already in its brief so it never re-derives what a formula settles.
+  No Write/Edit tools, no marker.
+- `.claude/skills/mail-review/SKILL.md` - drives both.
+- `golden-paths/pipelines/mail-lint.yml` - the gate.
+
+**The highest-value thing Barid does is not aesthetic.** It asks whether a
+clinical message is wearing a marketing template - because that inherits the
+marketing **consent gate**, and patients who never opted in then silently stop
+receiving mail they medically need. No regex reads intent; no error is raised
+when this fails.
+
+## Consequences
+
+- **No approval marker exists on this surface, so there is nothing to forge.**
+  The failure mode `pr-workflow.md` devotes a page to - an agent writing its own
+  approval - cannot occur, because the gate is a script reading a template
+  rather than an agent writing a file. This was a side effect of the CI choice,
+  not its motivation, and it is the strongest argument for it.
+- A local `gh pr merge` no longer blocks on mail lint directly. It blocks
+  because CI is red, one step earlier. Anyone disabling the workflow removes the
+  gate - the same exposure every CI-based check carries.
+- The `paths:` filter in the workflow duplicates `mail_design.template_globs`.
+  Two places to keep in sync; GitHub Actions cannot read the JSON to build its
+  own trigger.
+- A green check does not mean "fully audited" - it means nothing that ran
+  failed. The workflow writes the skipped-check list into the job summary so a
+  reader of a green run can see the difference.
+- Adopters with templates in a database or an ESP account get nothing yet; v1
+  reads HTML files from the repo. Those are adapters on the same linter.
+
+## Artifacts
+
+- `.claude/hooks/_lib-mail-lint.py`, `.claude/hooks/tests/test_mail_lint.sh` (12 cases)
+- `.claude/agents/mail-reviewer.md`, `.claude/skills/mail-review/SKILL.md`
+- `golden-paths/pipelines/mail-lint.yml`
+- `.claude/project-config.defaults.json` → `mail_design`
+
+## Postscript - two bugs the build found in itself
+
+Both are in the test suite as regressions, and both argue for the split this
+AgDR records.
+
+**The nesting bug.** The first draft attributed a colour to "the enclosing
+cell". The canonical email button is a `<td background:orange>` inside a
+`<td background:white>`, so the button's white label was measured against the
+white band and reported 1:1 - a false positive on a correct template. A linter
+the team learns to disbelieve stops being a gate. Fixed with a stack-based
+scan that resolves the *nearest* background-carrying ancestor.
+
+**The quote bug, written twice.** The font-fallback check used
+`font-family:[^;"']+`. A stack spelled `font-family:"Playfair Display"`
+produces **no match at all**, so the loop never ran and the exact violation the
+check exists to catch walked straight through. The identical defect had been
+independently written into the sibling guard in the project repo and was caught
+there in review. Two authorings, same mistake: a character class that excludes
+a quote cannot see a quoted font name.
+
+Neither would have been caught by a model reading templates and forming an
+opinion - which is the case for the deterministic half. And neither would have
+been caught without negative tests, which is the case for writing them.
+
+---
+
+*Part of [ApexYard](https://github.com/me2resh/apexyard) — multi-project SDLC framework for Claude Code · MIT.*
