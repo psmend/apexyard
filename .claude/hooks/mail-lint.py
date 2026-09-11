@@ -980,7 +980,16 @@ def parse_elements(text: str) -> tuple[Element, ...]:
                 name,
                 own_bg,
                 own_bg or inherited,
-                cell_depth + (1 if own_bg and name in ("td", "th") else 0),
+                # UNKNOWN_GROUND is a truthy str, so a bare `if own_bg` counted
+                # an image-backed cell as a depth-carrying band ancestor. _bands
+                # already drops that cell as unnameable, so the container
+                # vanished AND shadowed everything beneath it: one
+                # `background:url(spacer.gif)` on a wrapper took a template with
+                # two signature bands to clean. The gate silenced by the artifact
+                # it judges, again, through a sentinel added to prevent exactly
+                # that. Typed `str | None`, so nothing caught it statically.
+                cell_depth + (1 if own_bg and own_bg != UNKNOWN_GROUND
+                              and name in ("td", "th") else 0),
             ))
 
     # A tuple, because this is memoised: returning the list handed every caller

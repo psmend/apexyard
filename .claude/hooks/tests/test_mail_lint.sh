@@ -296,6 +296,25 @@ EXTRA="" write_template
 sed -i 's|<tr><td style="background-color:#FFFDF9;padding:32px;">|<tr><td style="background: url(band.png);padding:32px;">|' "$FIX/emails/t.html"
 check "reports a CTA sitting on an image ground" "visible at all"
 
+# An image-backed wrapper must not SHADOW the bands inside it. The sentinel is
+# truthy, so it counted as a depth-carrying ancestor while _bands dropped the
+# cell itself as unnameable - one spacer gif on a wrapper hid a second
+# signature band and took a failing template to clean. The image-ground cases
+# above all cover contrast and CTA; this is the band path.
+cat > "$FIX/emails/t.html" <<'HTML'
+<table cellpadding="0" cellspacing="0" width="600" style="width:600px;">
+<tr><td style="background-color:#E3FF6B;padding:32px;">
+  <p style="color:#131110;">First signature band</p>
+</td></tr>
+<tr><td style="background:url(spacer.gif);">
+  <table cellpadding="0" cellspacing="0"><tr><td style="background-color:#E3FF6B;padding:32px;">
+    <p style="color:#131110;">Second signature band, nested under an image cell</p>
+  </td></tr></table>
+</td></tr>
+</table>
+HTML
+RUN_ARGS="--family marketing" check "counts a band nested inside an image-backed cell" "signature bands"
+
 # A gradient is no more measurable than a photograph - resolving it to its
 # first stop would be a guess reported as a measurement.
 EXTRA='<tr><td style="background: linear-gradient(to right, #FFFDF9, #131110);"><font color="#FFFDF9">faint</font></td></tr>' write_template
