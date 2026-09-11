@@ -294,7 +294,7 @@ check "an image ground with no text over it raises nothing" ""
 # measuring against a colour it does not sit on.
 EXTRA="" write_template
 sed -i 's|<tr><td style="background-color:#FFFDF9;padding:32px;">|<tr><td style="background: url(band.png);padding:32px;">|' "$FIX/emails/t.html"
-check "reports a CTA sitting on an image ground" "background IMAGE"
+check "reports a CTA sitting on an image ground" "visible at all"
 
 # A gradient is no more measurable than a photograph - resolving it to its
 # first stop would be a guess reported as a measurement.
