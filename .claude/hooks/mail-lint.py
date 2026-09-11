@@ -47,8 +47,11 @@ import glob
 import json
 import os
 import re
+import signal
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 # --------------------------------------------------------------------------
 # config
@@ -69,19 +72,52 @@ def _ops_root(start: str) -> str:
     return os.path.abspath(start)
 
 
+class ConfigError(Exception):
+    """The adopter's override config exists but cannot be used."""
+
+
 def load_config(ops_root: str) -> dict:
-    """Defaults, then a shallow merge of the adopter override."""
+    """
+    Defaults, then a shallow merge of the adopter override.
+
+    **The override fails CLOSED.** An earlier version caught OSError and
+    JSONDecodeError on both files and continued, which produced the worst
+    possible failure: a truncated `project-config.json` silently dropped the
+    adopter's brand rules back to the framework defaults, the palette check
+    vanished, and the only trace was a line in the SKIPPED list that reads
+    *identically* to "you never configured this". A security review reproduced
+    it - same template, 3 errors with a valid config and 1 with a truncated one,
+    and on a template with no universal violations the job would have gone
+    green. A config you cannot parse is not a config you may quietly replace
+    with something looser.
+
+    The DEFAULTS file is different and still tolerant: its absence is a normal
+    state for a partial checkout, and it grants nothing the adopter did not
+    already have.
+    """
     cfg: dict = {}
     base = os.path.join(ops_root, ".claude", "project-config.defaults.json")
     over = os.path.join(ops_root, ".claude", "project-config.json")
-    for path in (base, over):
-        if not os.path.isfile(path):
-            continue
+
+    if os.path.isfile(base):
         try:
-            with open(path, encoding="utf-8") as fh:
+            with open(base, encoding="utf-8") as fh:
                 loaded = json.load(fh)
+            if isinstance(loaded.get("mail_design"), dict):
+                cfg = loaded["mail_design"]
         except (OSError, json.JSONDecodeError):
-            continue
+            pass  # tolerated: absent or unreadable defaults grant nothing
+
+    if os.path.isfile(over):
+        try:
+            with open(over, encoding="utf-8") as fh:
+                loaded = json.load(fh)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ConfigError(
+                f"{over} exists but could not be read: {exc}. Refusing to fall back to "
+                "framework defaults - that would silently drop your brand rules and "
+                "report a pass it did not earn. Fix the file, or remove it."
+            ) from exc
         if isinstance(loaded.get("mail_design"), dict):
             cfg = loaded["mail_design"]  # shallow: the override replaces wholesale
     return cfg
@@ -91,7 +127,25 @@ def load_config(ops_root: str) -> dict:
 # colour + contrast (WCAG 2.1 relative luminance)
 # --------------------------------------------------------------------------
 
-HEX_RE = re.compile(r"#[0-9a-fA-F]{6}\b")
+# Both hex spellings. Requiring six digits made `color:#ddd` on
+# `background-color:#eee` - off-palette and 1.2:1 - report clean, and the
+# three-digit form is ubiquitous. Everything downstream normalises via
+# `_norm_hex` so the rest of the file only ever sees six digits.
+#
+# The SIX-digit branch is first on purpose. Alternation is ordered, so with
+# the short branch first `#131110` matched `#131` and normalised to
+# `#113311` - a colour that appears nowhere in the document, reported against
+# a real line number. Caught by the suite immediately; it would have been
+# very hard to spot in the wild.
+HEX_RE = re.compile(r"#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b")
+
+
+def _norm_hex(h: str) -> str:
+    """#abc -> #aabbcc, lowercased. Idempotent on the six-digit form."""
+    h = h.strip().lower()
+    if len(h) == 4:
+        return "#" + "".join(c * 2 for c in h[1:])
+    return h
 
 
 def _srgb_to_linear(channel: int) -> float:
@@ -150,6 +204,91 @@ class Report:
         return sum(1 for f in self.findings if f.severity == "error")
 
 
+# Adopter-supplied regexes run against at most this much text. A security
+# review confirmed catastrophic backtracking on a config-supplied `(a+)+$`
+# against 40 characters - it ran past 25 seconds and was still going. A cap
+# does not make a pathological pattern linear, but it bounds the damage to
+# something a job timeout survives, and the compile guard below turns the
+# other half (a malformed pattern) from an uncaught traceback into a finding.
+REGEX_INPUT_CAP = 200_000
+# Files larger than this are not linted. Nothing legitimate approaches it - a
+# 600px email is a few KB - and an unbounded read is how a single file stalls
+# a runner.
+MAX_TEMPLATE_BYTES = 2_000_000
+
+
+REGEX_TIMEOUT_SECONDS = 5
+
+
+class _RegexTimeout(Exception):
+    pass
+
+
+@contextmanager
+def _time_limit(seconds: int):
+    """
+    Wall-clock ceiling for one config-supplied regex.
+
+    An input cap is NOT sufficient here and it was the first thing tried. A
+    security review confirmed `(a+)+$` against **40 characters** backtracking
+    past 25 seconds - the blowup is exponential in the input, so capping the
+    input at 200KB bounds nothing that matters. Only a clock does.
+
+    SIGALRM is main-thread Unix only. Where it is unavailable the guard
+    degrades to nothing rather than failing the run, because a linter that
+    refuses to start on an unusual platform is worse than one that can be hung
+    by a config the adopter wrote themselves.
+    """
+    if not hasattr(signal, "SIGALRM"):
+        yield
+        return
+
+    def _fire(signum, frame):
+        raise _RegexTimeout()
+
+    previous = signal.signal(signal.SIGALRM, _fire)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def _run_guarded(rx, text: str, where: str, path: str, rep: Report, finder="finditer"):
+    """Run a config-supplied regex under the clock, reporting a hang as a finding."""
+    try:
+        with _time_limit(REGEX_TIMEOUT_SECONDS):
+            return list(getattr(rx, finder)(text))
+    except _RegexTimeout:
+        rep.add(
+            "error",
+            "config",
+            f"`{where}` did not finish within {REGEX_TIMEOUT_SECONDS}s and was abandoned - "
+            "almost certainly catastrophic backtracking (nested quantifiers such as "
+            "`(a+)+`). Rewrite the pattern. This is a CONFIG defect, not a template one.",
+            path,
+            0,
+        )
+        return []
+
+
+def _safe_compile(pattern: str, where: str, path: str, rep: Report):
+    """Compile config-supplied regex, reporting rather than crashing."""
+    try:
+        return re.compile(pattern)
+    except re.error as exc:
+        rep.add(
+            "error",
+            "config",
+            f"`{where}` is not a valid regular expression ({exc}). Fix the pattern in "
+            "`.claude/project-config.json`. This is a CONFIG defect, not a template one.",
+            path,
+            0,
+        )
+        return None
+
+
 def line_of(text: str, index: int) -> int:
     return text.count("\n", 0, index) + 1
 
@@ -171,9 +310,29 @@ IMG_RE = re.compile(r"<img\b[^>]*>", re.I | re.S)
 TD_OPEN_RE = re.compile(r"<t[dh]\b[^>]*>", re.I)
 
 
+# Every universal rule, so an OFF one can be named rather than silently absent.
+UNIVERSAL_RULES = (
+    "forbid_alpha_colour", "forbid_layout_style_block", "forbid_third_party_fonts",
+    "forbid_script", "forbid_css_filter", "require_img_alt", "require_img_width",
+    "require_table_layout", "forbid_modern_layout",
+)
+
+
 def check_universal(text: str, path: str, uni: dict, rep: Report) -> None:
     def on(key: str) -> bool:
         return bool(uni.get(key, True))
+
+    # The skip-loudly contract applied to itself. Four brand checks honoured it
+    # and nothing else did, so a config with every universal rule turned off
+    # produced "clean" with no SKIPPED section - and the CI summary went on to
+    # print "All configured checks ran." That is exactly the liability this
+    # module's docstring claims to avoid, so it is now enforced for every rule
+    # rather than asserted in prose.
+    for key in UNIVERSAL_RULES:
+        if not on(key):
+            rep.skip(key, f"universal.{key} is disabled in config")
+    if not uni.get("expected_width_px"):
+        rep.skip("column-width", "no universal.expected_width_px configured")
 
     if on("forbid_alpha_colour"):
         rep.checked.append("alpha-colour")
@@ -196,7 +355,24 @@ def check_universal(text: str, path: str, uni: dict, rep: Report) -> None:
         # installed locally, which is almost nobody. Permit it freely and Gmail
         # silently strips the layout rules and the mail falls apart with no
         # error anywhere. So: @font-face may live there, and nothing else.
-        for m in re.finditer(r"<style\b[^>]*>(.*?)</style\s*>", text, re.I | re.S):
+        # Cheap pre-check first. The `.*?` scan rescans to end-of-input from
+        # every failed start position, so a document of 20,000 unclosed
+        # `<style>` tags measured 47 seconds. If there is no closing tag at all
+        # there is nothing to find, and the expensive scan is skipped.
+        if not re.search(r"</style", text, re.I):
+            if re.search(r"<style\b", text, re.I):
+                rep.add(
+                    "error",
+                    "style-block",
+                    "A <style> tag is opened and never closed. Mail clients recover from "
+                    "this unpredictably, and the linter cannot tell what is inside it.",
+                    path,
+                    line_of(text, re.search(r"<style\b", text, re.I).start()),
+                )
+            return_early_style = True
+        else:
+            return_early_style = False
+        for m in ([] if return_early_style else re.finditer(r"<style\b[^>]*>(.*?)</style\s*>", text, re.I | re.S)):
             body = re.sub(r"@font-face\s*\{[^}]*\}", "", m.group(1), flags=re.I | re.S)
             if body.strip():
                 rep.add(
@@ -287,11 +463,11 @@ def check_palette(text: str, path: str, cfg: dict, rep: Report) -> None:
         rep.skip("palette", "no mail_design.palette configured")
         return
     rep.checked.append("palette")
-    known = {v.lower() for v in palette.values() if isinstance(v, str) and v.startswith("#")}
-    known |= {v.lower() for v in (cfg.get("allow_hex_outside_palette") or [])}
+    known = {_norm_hex(v) for v in palette.values() if isinstance(v, str) and v.startswith("#")}
+    known |= {_norm_hex(v) for v in (cfg.get("allow_hex_outside_palette") or [])}
     seen: set[str] = set()
     for m in HEX_RE.finditer(text):
-        hexv = m.group(0).lower()
+        hexv = _norm_hex(m.group(0))
         if hexv in known or hexv in seen:
             continue
         seen.add(hexv)
@@ -339,8 +515,17 @@ def check_fonts(text: str, path: str, cfg: dict, rep: Report) -> None:
 TAG_RE = re.compile(r"<(/?)([a-zA-Z][\w-]*)\b([^>]*)>", re.S)
 VOID_TAGS = {"img", "br", "hr", "meta", "link", "input", "source", "area",
              "base", "col", "embed", "param", "track", "wbr"}
-BG_RE = re.compile(r"background(?:-color)?\s*:\s*(#[0-9a-fA-F]{6})", re.I)
-FG_RE = re.compile(r"(?<!-)\bcolor\s*:\s*(#[0-9a-fA-F]{6})", re.I)
+_HEX = r"#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})"
+BG_RE = re.compile(rf"background(?:-color)?\s*:\s*({_HEX})", re.I)
+FG_RE = re.compile(rf"(?<!-)\bcolor\s*:\s*({_HEX})", re.I)
+# The PRESENTATIONAL attribute forms. `bgcolor="#FFFDF9"` is the attribute
+# Outlook actually honours and the one every email framework emits, so reading
+# only the CSS form made the linter blind on the most common authoring style -
+# it missed a 1.6:1 body and a CTA on the wrong band, AND raised a false
+# "no signature band" on a template whose band was right there. Failing in both
+# directions at once is the worst thing a linter can do.
+BG_ATTR_RE = re.compile(rf"\bbgcolor\s*=\s*[\"\']?({_HEX})", re.I)
+FG_ATTR_RE = re.compile(rf"<font\b[^>]*\bcolor\s*=\s*[\"\']?({_HEX})", re.I)
 
 
 @dataclass
@@ -354,6 +539,26 @@ class Element:
     cell_depth: int             # background-carrying td/th ancestors - see _bands()
 
 
+def _strip_comments(text: str) -> str:
+    """
+    Blank out HTML comments, preserving offsets so line numbers stay true.
+
+    The MSO ghost-table idiom is deliberately unbalanced across two
+    comments and is standard production email:
+
+        <!--[if mso]><table><tr><td bgcolor=...><![endif]-->
+        <tr><td ...>   the real band   </td></tr>
+        <!--[if mso]></td></tr></table><![endif]-->
+
+    Letting those tags into the stack made the ghost <td> the only depth-0
+    band and demoted the real one, producing an ERROR-severity false
+    positive that fails CI on a correct, industry-standard template. That is
+    the outcome this module's own docstring calls fatal.
+    """
+    return re.sub(r"<!--.*?-->", lambda m: " " * len(m.group(0)), text, flags=re.S)
+
+
+@lru_cache(maxsize=4)
 def parse_elements(text: str) -> list[Element]:
     """
     Walk the document maintaining a tag stack, so every colour is resolved
@@ -369,6 +574,7 @@ def parse_elements(text: str) -> list[Element]:
     """
     stack: list[tuple[str, str | None]] = []
     out: list[Element] = []
+    text = _strip_comments(text)
 
     for m in TAG_RE.finditer(text):
         closing, name, attrs = m.group(1), m.group(2).lower(), m.group(3)
@@ -381,10 +587,11 @@ def parse_elements(text: str) -> list[Element]:
             continue
 
         style = _style_of(m.group(0))
-        own_bg_m = BG_RE.search(style) or BG_RE.search(attrs)
-        own_bg = own_bg_m.group(1).lower() if own_bg_m else None
-        fg_m = FG_RE.search(style)
-        fg = fg_m.group(1).lower() if fg_m else None
+        whole = m.group(0)
+        own_bg_m = BG_RE.search(style) or BG_ATTR_RE.search(whole)
+        own_bg = _norm_hex(own_bg_m.group(1)) if own_bg_m else None
+        fg_m = FG_RE.search(style) or FG_ATTR_RE.search(whole)
+        fg = _norm_hex(fg_m.group(1)) if fg_m else None
 
         inherited = next((bg for _, bg in reversed(stack) if bg), None)
         cell_depth = sum(1 for n, bg in stack if bg and n in ("td", "th"))
@@ -447,12 +654,15 @@ def check_contrast(text: str, path: str, cfg: dict, rep: Report) -> None:
 
 def check_cta(text: str, path: str, cfg: dict, rep: Report) -> None:
     cta = cfg.get("cta") or {}
-    fill = (cta.get("fill") or "").lower()
-    if not fill:
+    fill = _norm_hex(cta.get("fill") or "")
+    if not fill.startswith("#"):
         rep.skip("cta-ground", "no mail_design.cta.fill configured")
         return
     rep.checked.append("cta-ground")
-    allowed = {g.lower() for g in (cta.get("allowed_grounds") or [])}
+    allowed = {_norm_hex(g) for g in (cta.get("allowed_grounds") or [])}
+    if not allowed:
+        rep.skip("cta-allowlist", "no mail_design.cta.allowed_grounds configured - "
+                                  "the measured floor below still applies")
     non_text = float((cfg.get("contrast") or {}).get("non_text_min", 3.0))
 
     # Ask what the button SITS ON, not what it is. An earlier refactor changed
@@ -466,8 +676,25 @@ def check_cta(text: str, path: str, cfg: dict, rep: Report) -> None:
             continue
         occurrences += 1
         ground = el.parent_ground
-        if allowed and ground and ground not in allowed:
-            ratio = contrast(fill, ground)
+        if not ground:
+            continue
+        ratio = contrast(fill, ground)
+        # The MEASURED floor, enforced independently of the allowlist. This was
+        # read, interpolated into a message, and never compared to anything -
+        # so a button at 2.97:1 against its band passed clean whenever
+        # allowed_grounds was empty, while the config comment claimed this was
+        # the failure it caught.
+        if ratio < non_text:
+            rep.add(
+                "error",
+                "cta-contrast",
+                f"The action colour {fill} measures {ratio:.2f}:1 against the ground it "
+                f"sits on ({ground}), below the {non_text}:1 non-text minimum. The label "
+                f"can be perfect and the button still has no visible edge.",
+                path,
+                line_of(text, el.offset),
+            )
+        if allowed and ground not in allowed:
             rep.add(
                 "error",
                 "cta-ground",
@@ -512,8 +739,28 @@ def check_family(text: str, path: str, cfg: dict, family: str, rep: Report) -> N
         elif count > cap:
             rep.add("error", "family", f"{count} signature bands for family `{family}`; the spec allows {cap}. A second one turns a system into decoration.", path, 1)
 
-    if spec.get("requires_photo") and not IMG_RE.search(text):
-        rep.add("error", "family", f"Family `{family}` requires a photograph and the template has no <img>.", path, 1)
+    if spec.get("requires_photo"):
+        # "Has an <img>" was the first version and it was useless: the ink
+        # header strip carries the logo, so EVERY template satisfied it and the
+        # check could never fail. A test written for it passed against a
+        # template with the photo deleted, which is how it was caught.
+        #
+        # A photograph in this layout is full-bleed; a logo is not. Width is the
+        # discriminator that actually separates them.
+        min_w = int(spec.get("photo_min_width") or 400)
+        widths = [
+            int(w) for w in re.findall(r"<img\b[^>]*\bwidth\s*=\s*[\"\']?(\d+)", text, re.I)
+        ]
+        if not any(w >= min_w for w in widths):
+            rep.add(
+                "error",
+                "family",
+                f"Family `{family}` requires a photograph - an image at least {min_w}px "
+                f"wide. Found: {widths or 'no sized images'}. A logo in the header strip "
+                "does not satisfy this.",
+                path,
+                1,
+            )
 
     if spec.get("allows_unsubscribe") is False:
         for m in re.finditer(r"unsubscribe", text, re.I):
@@ -537,13 +784,26 @@ def check_family(text: str, path: str, cfg: dict, family: str, rep: Report) -> N
 
 def check_copy(text: str, path: str, cfg: dict, rep: Report) -> None:
     copy = cfg.get("copy") or {}
+    if not (copy.get("forbidden_patterns") or []):
+        rep.skip("forbidden-pattern", "no mail_design.copy.forbidden_patterns configured")
+    if not (copy.get("forbidden_words") or []):
+        rep.skip("forbidden-word", "no mail_design.copy.forbidden_words configured")
+    if not (copy.get("placeholder_tokens") or []):
+        rep.skip("placeholder", "no mail_design.copy.placeholder_tokens configured")
+    if not copy.get("variable_syntax"):
+        rep.skip("variables", "no mail_design.copy.variable_syntax configured")
 
     for entry in copy.get("forbidden_patterns") or []:
         pat, msg = entry.get("pattern"), entry.get("message", "Forbidden pattern.")
         if not pat:
             continue
         rep.checked.append("forbidden-pattern")
-        for m in re.finditer(pat, text):
+        rx = _safe_compile(pat, "copy.forbidden_patterns[].pattern", path, rep)
+        if rx is None:
+            continue
+        hits = _run_guarded(rx, text[:REGEX_INPUT_CAP],
+                            "copy.forbidden_patterns[].pattern", path, rep)
+        for m in hits:
             rep.add("error", "forbidden-pattern", msg, path, line_of(text, m.start()))
             break
 
@@ -566,7 +826,14 @@ def check_copy(text: str, path: str, cfg: dict, rep: Report) -> None:
     syntax = copy.get("variable_syntax")
     if syntax:
         rep.checked.append("variables")
-        used = sorted(set(re.findall(syntax, text)))
+        rx = _safe_compile(syntax, "copy.variable_syntax", path, rep)
+        if rx is None:
+            return
+        # Bound what a capture group can drag into a finding. The default syntax
+        # captures a token name; a hostile one captured the whole file.
+        raw = _run_guarded(rx, text[:REGEX_INPUT_CAP], "copy.variable_syntax",
+                           path, rep, finder="findall")
+        used = sorted({(m if isinstance(m, str) else " ".join(m))[:80] for m in raw})
         if used:
             rep.add("info", "variables", f"Declares these variables: {', '.join(used)}. Every one must appear in the template's declared variable list - an undeclared token renders as an empty string, silently.", path, 1)
 
@@ -578,11 +845,24 @@ def check_copy(text: str, path: str, cfg: dict, rep: Report) -> None:
 
 def lint_file(path: str, cfg: dict, family: str, rep: Report) -> None:
     try:
+        size = os.path.getsize(path)
+        if size > MAX_TEMPLATE_BYTES:
+            rep.add(
+                "error",
+                "too-large",
+                f"{size} bytes exceeds the {MAX_TEMPLATE_BYTES}-byte lint cap and was NOT "
+                "checked. A 600px email is a few KB; this is either not a template or it "
+                "carries something that does not belong inline.",
+                path,
+                0,
+            )
+            return
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
     except OSError as exc:
         rep.add("error", "unreadable", f"Could not read: {exc}", path, 0)
         return
+    parse_elements.cache_clear()  # per-file memo; see parse_elements
     check_universal(text, path, cfg.get("universal") or {}, rep)
     check_palette(text, path, cfg, rep)
     check_fonts(text, path, cfg, rep)
@@ -592,16 +872,61 @@ def lint_file(path: str, cfg: dict, family: str, rep: Report) -> None:
     check_copy(text, path, cfg, rep)
 
 
-def resolve_targets(args_paths: list[str], cfg: dict, root: str) -> list[str]:
+def resolve_targets(args_paths: list[str], cfg: dict, root: str, rep: Report) -> list[str]:
+    """
+    Resolve the templates to lint, and refuse to leave the repo.
+
+    `mail_design.template_globs` is adopter-supplied config, and config is not
+    a trust boundary you get for free. Two things made it one:
+
+    - `os.path.join(root, pattern)` **discards root entirely when pattern is
+      absolute**, so "/home/you/.ssh/id_rsa" resolved as directly as the "../"
+      form.
+    - Findings echo matched substrings, and `copy.variable_syntax` is *also*
+      adopter-supplied, so a capture group of `(?s)(.+)` printed whatever the
+      first bullet had selected.
+
+    Together that was: config picks any readable file, config-supplied regex
+    extracts any part of it, result is printed. A security review demonstrated
+    it end to end against /etc/hostname. In CI the yield was low (a read-only,
+    job-scoped token), but the skill instructs an agent to run this against
+    whatever branch is checked out - so locally it was arbitrary-file-read on
+    the operator's machine, triggered by a file in a branch.
+
+    So: resolve every candidate and drop anything outside the root, loudly. A
+    rejection is a finding, not a silent skip - a linter that quietly ignores
+    what you asked it to check is the failure mode this whole file is against.
+    """
+    real_root = os.path.realpath(root)
+
+    def contained(p: str) -> bool:
+        rp = os.path.realpath(p)
+        return rp == real_root or rp.startswith(real_root + os.sep)
+
+    raw: list[str] = []
     if args_paths:
-        out: list[str] = []
         for p in args_paths:
-            out.extend(sorted(glob.glob(p, recursive=True)) if any(c in p for c in "*?[") else [p])
-        return [p for p in out if os.path.isfile(p)]
-    found: list[str] = []
-    for pattern in cfg.get("template_globs") or []:
-        found.extend(sorted(glob.glob(os.path.join(root, pattern), recursive=True)))
-    return [p for p in found if os.path.isfile(p)]
+            raw.extend(sorted(glob.glob(p, recursive=True)) if any(c in p for c in "*?[") else [p])
+    else:
+        for pattern in cfg.get("template_globs") or []:
+            raw.extend(sorted(glob.glob(os.path.join(root, pattern), recursive=True)))
+
+    out: list[str] = []
+    for p in raw:
+        if not os.path.isfile(p):
+            continue
+        if not contained(p):
+            rep.add(
+                "error",
+                "path-escape",
+                f"`{p}` resolves outside {real_root} and was NOT linted. Template globs "
+                "may not reach outside the repository.",
+                p,
+                0,
+            )
+            continue
+        out.append(p)
+    return out
 
 
 def main(argv: list[str]) -> int:
@@ -610,18 +935,62 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--family", default="", help="Force a family instead of detecting it from the signature ground.")
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     ap.add_argument("--root", default=os.getcwd())
+    ap.add_argument(
+        "--require-match",
+        action="store_true",
+        help="Exit non-zero if no template matched. CI passes this: the workflow only "
+             "runs when a template path changed, so finding none means the globs and the "
+             "workflow's paths filter have drifted apart and the gate is silently absent.",
+    )
     args = ap.parse_args(argv)
 
     root = _ops_root(args.root)
-    cfg = load_config(root)
+    try:
+        cfg = load_config(root)
+    except ConfigError as exc:
+        # Exit 2, not 1. A broken config is not a lint finding, and a caller
+        # that cannot tell "your templates are wrong" from "your config is
+        # unreadable" will treat the second as the first.
+        print(f"mail-lint: CONFIG ERROR - {exc}", file=sys.stderr)
+        return 2
+    # B-5: a gate that returns GREEN when it is misconfigured is worse than no
+    # gate. Three ways this used to happen, all exit 0:
+    #   - `mail_design` absent entirely
+    #   - a partial override - {"mail_design": {"palette": ..., "cta": ...}} is
+    #     the most natural thing an adopter writes - silently dropping
+    #     `template_globs`, because the merge is shallow
+    #   - zero templates matched
+    # The first two are unambiguously broken config. The third can be
+    # legitimate, so it warns by default and is fatal under --require-match,
+    # which is what CI passes.
     if not cfg:
-        print("mail-lint: no mail_design config found; nothing to check.", file=sys.stderr)
-        return 0
+        print(
+            "mail-lint: CONFIG ERROR - no `mail_design` block found in either "
+            "project-config.defaults.json or project-config.json. Refusing to report a "
+            "pass for a check that never ran.",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.paths and not (cfg.get("template_globs") or []):
+        print(
+            "mail-lint: CONFIG ERROR - `mail_design.template_globs` is empty or missing, so "
+            "no template could ever be found. This is the classic partial-override trap: the "
+            "merge is SHALLOW, so defining `mail_design` in project-config.json replaces the "
+            "whole subtree and drops any key you did not copy across.",
+            file=sys.stderr,
+        )
+        return 2
 
-    targets = resolve_targets(args.paths, cfg, root)
     rep = Report()
-    if not targets:
-        print("mail-lint: no templates matched.", file=sys.stderr)
+    targets = resolve_targets(args.paths, cfg, root, rep)
+    if not targets and not rep.findings:
+        msg = ("mail-lint: no templates matched " + (", ".join(args.paths) if args.paths
+               else ", ".join(cfg.get("template_globs") or [])) +
+               " - NOTHING WAS CHECKED.")
+        print(msg, file=sys.stderr)
+        if args.require_match:
+            print("mail-lint: --require-match was set, so this is a failure.", file=sys.stderr)
+            return 2
         return 0
 
     for path in targets:

@@ -43,7 +43,7 @@ on:
       - 'emails/**/*.html'
       - '**/email-templates/**/*.html'
       - '.claude/project-config.json'
-      - '.claude/hooks/_lib-mail-lint.py'
+      - '.claude/hooks/mail-lint.py'
 
 permissions:
   contents: read
@@ -61,34 +61,61 @@ jobs:
 
       - name: Lint templates
         run: |
-          if [ ! -f .claude/hooks/_lib-mail-lint.py ]; then
-            echo "::error::.claude/hooks/_lib-mail-lint.py is missing - is the apexyard .claude/ layer installed?"
+          if [ ! -f .claude/hooks/mail-lint.py ]; then
+            echo "::error::.claude/hooks/mail-lint.py is missing - is the apexyard .claude/ layer installed?"
             exit 1
           fi
-          python3 .claude/hooks/_lib-mail-lint.py
+          # --require-match: this job only runs when a template path changed, so
+          # finding zero templates means the globs and the paths filter below
+          # have drifted apart and the gate is silently absent. Exit 2 (config
+          # broken) is distinct from exit 1 (templates broken).
+          python3 .claude/hooks/mail-lint.py --require-match
 
-      # The linter SKIPS any check whose brand config is empty, and says so on
-      # stdout. A green check therefore does not mean "fully audited" - it means
-      # "nothing that was checked failed". Surface the skip list in the job
-      # summary so a reader of a green run can see what it did not cover.
+      # A green check does NOT mean "fully audited" - it means nothing that ran
+      # failed. Surface what did not run, so a reader of a green job can see the
+      # difference.
+      #
+      # The first version of this step reported "All configured checks ran."
+      # whenever the JSON was missing - including when the linter had CRASHED,
+      # because `|| true` discarded the exit code and left a 0-byte file. A
+      # security review caught it. The step that exists to prevent silence about
+      # unrun checks was the one place producing it, so it now has a third state
+      # and never guesses.
       - name: Report unchecked rules
         if: always()
         run: |
-          python3 .claude/hooks/_lib-mail-lint.py --json > /tmp/mail-lint.json 2>/dev/null || true
-          skipped=$(python3 -c "
-          import json,sys
-          try: d=json.load(open('/tmp/mail-lint.json'))
-          except Exception: sys.exit(0)
-          for s in d.get('skipped', []): print('- ' + s)
-          ")
+          set +e
+          python3 .claude/hooks/mail-lint.py --json > /tmp/mail-lint.json 2>/tmp/mail-lint.err
+          lint_rc=$?
+          set -e
+
           {
             echo "### Mail lint"
-            if [ -n "$skipped" ]; then
-              echo "These checks did **not** run, so this result says nothing about them:"
-              echo "$skipped"
+            if [ "$lint_rc" -ge 2 ] || [ ! -s /tmp/mail-lint.json ]; then
+              echo "⚠️ **The linter did not produce a report, so this run says nothing about any check.**"
               echo ""
-              echo "Configure them in \`.claude/project-config.json\` → \`mail_design\`."
+              echo '```'
+              head -20 /tmp/mail-lint.err 2>/dev/null || echo "(no stderr captured)"
+              echo '```'
             else
-              echo "All configured checks ran."
+              skipped=$(python3 -c "
+          import json
+          d = json.load(open('/tmp/mail-lint.json'))
+          for s in d.get('skipped', []):
+              print('- ' + s)
+          ")
+              ran=$(python3 -c "
+          import json
+          d = json.load(open('/tmp/mail-lint.json'))
+          print(len(d.get('checks_run', [])))
+          ")
+              echo "$ran check(s) ran."
+              if [ -n "$skipped" ]; then
+                echo ""
+                echo "These did **not** run, so this result says nothing about them:"
+                echo "$skipped"
+                echo ""
+                echo "Configure them in \`.claude/project-config.json\` → \`mail_design\`."
+              fi
             fi
           } >> "$GITHUB_STEP_SUMMARY"

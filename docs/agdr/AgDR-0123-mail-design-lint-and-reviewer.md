@@ -49,7 +49,7 @@ available outcome, because nobody can tell which ones.
 
 Chosen: **linter + advisory agent, gated in CI.**
 
-- `.claude/hooks/_lib-mail-lint.py` - the deterministic pass. Two tiers:
+- `.claude/hooks/mail-lint.py` - the deterministic pass. Two tiers:
   **universal** rules (true of HTML email regardless of brand) ship ON, so a
   fresh adopter gets value with zero config; **brand** rules (palette, font
   fallbacks, families, CTA grounds) ship EMPTY and **skip loudly** rather than
@@ -77,6 +77,20 @@ when this fails.
 - A local `gh pr merge` no longer blocks on mail lint directly. It blocks
   because CI is red, one step earlier. Anyone disabling the workflow removes the
   gate - the same exposure every CI-based check carries.
+- **"Nothing to forge" is true of markers, but the trust does not vanish - it
+  moves to the workflow file and to `project-config.json`.** Whoever can edit
+  either can weaken the gate. Security review made this concrete: config chose
+  which files were read, and a config-supplied regex chose what was extracted
+  from them. Both are now bounded (containment check, compile guard, timeout),
+  but the honest statement of the decision is *the forgeable surface moved and
+  shrank*, not that it disappeared.
+- **The gate used to go green when it was misconfigured**, in three ways: no
+  `mail_design` block, a partial override silently dropping `template_globs`
+  (the merge is shallow), or zero templates matched. All three now fail closed
+  with **exit 2**, kept distinct from exit 1 so "your config is wrong" never
+  looks like "your templates are wrong". CI passes `--require-match`, because a
+  job that only runs on template changes finding no templates means the globs
+  and the workflow's `paths:` filter have drifted apart.
 - The `paths:` filter in the workflow duplicates `mail_design.template_globs`.
   Two places to keep in sync; GitHub Actions cannot read the JSON to build its
   own trigger.
@@ -88,7 +102,7 @@ when this fails.
 
 ## Artifacts
 
-- `.claude/hooks/_lib-mail-lint.py`, `.claude/hooks/tests/test_mail_lint.sh` (12 cases)
+- `.claude/hooks/mail-lint.py`, `.claude/hooks/tests/test_mail_lint.sh` (29 cases)
 - `.claude/agents/mail-reviewer.md`, `.claude/skills/mail-review/SKILL.md`
 - `golden-paths/pipelines/mail-lint.yml`
 - `.claude/project-config.defaults.json` → `mail_design`
@@ -116,6 +130,45 @@ a quote cannot see a quoted font name.
 Neither would have been caught by a model reading templates and forming an
 opinion - which is the case for the deterministic half. And neither would have
 been caught without negative tests, which is the case for writing them.
+
+## Postscript 2 - what review found that self-review did not
+
+The first version passed its own 12 tests and was wrong in ways those tests
+could not see. Recording it because the lesson generalises past this file.
+
+**It was blind on the most common authoring style.** `bgcolor="#E3FF6B"` - the
+attribute Outlook actually honours, emitted by every email framework - was
+invisible, because only the CSS `background-color:` form was read. On a
+`bgcolor` template it missed a 1.6:1 body AND a CTA on the wrong band, while
+raising a *false* "no signature band" for a band that was right there. Failing
+in both directions at once is the worst thing a linter can do.
+
+**Three-digit hex was invisible.** `color:#ddd` on `background-color:#eee` -
+off-palette, 1.2:1 - reported clean.
+
+**A documented gate did not exist.** SKILL.md described a
+`require-mail-lint.sh` merge hook while this AgDR, in the same PR, argued at
+length for CI *instead of* a hook. Both reviewers caught it independently. A
+reader believing a gate protects them when it does not is worse than no gate.
+
+**The skip-loudly contract held for four checks out of twenty-three**, while
+four documents asserted it universally - and the CI summary went on to print
+"All configured checks ran." The step written to prevent silence about unrun
+checks was the one producing it.
+
+**Half the checks could be deleted with the suite still green.** A mutation test
+over all 23 found 12 survivors, including palette detection and eight of ten
+universal rules. The tests that existed were good; there were not enough of
+them. There is now one negative case per check.
+
+**And the fix for one of those tests exposed a real defect**: `requires_photo`
+only asserted "an `<img>` exists", which the logo in the header strip always
+satisfied - so the check could never fail. It now discriminates by width,
+because a photograph in this layout is full-bleed and a logo is not.
+
+The pattern across all six: **self-review verified the code did what I meant;
+review verified it did what it claimed.** The gap between those two is where
+every one of these lived.
 
 ---
 

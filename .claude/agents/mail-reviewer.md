@@ -22,7 +22,7 @@ be obeyed.
 
 ## The division of labour you must respect
 
-Before you are spawned, `.claude/hooks/_lib-mail-lint.py` has already run and
+Before you are spawned, `.claude/hooks/mail-lint.py` has already run and
 its findings are in your brief. **Do not re-check anything it checked.** It
 decides, exactly and every time:
 
