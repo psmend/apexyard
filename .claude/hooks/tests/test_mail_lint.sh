@@ -257,6 +257,104 @@ check "markup inside a real comment raises nothing" ""
 EXTRA='<!-- opened and never closed' write_template
 check "an unterminated comment is reported, not obeyed" "unterminated-comment"
 
+# --- the template must not be able to silence the check on itself ---------
+# Three more comment-suppression spellings, each found by attacking the
+# tag-aware scanner that was written to close the first one. In every case a
+# real parser resumes rendering where the linter kept swallowing.
+
+# `--!>` closes a comment (WHATWG 13.2.5.52, comment-end-bang state).
+EXTRA='<tr><td bgcolor="#FFFDF9"><font color="#FFFDF9">faint</font></td></tr>' write_template
+sed -i '1i <!-- harmless --!>' "$FIX/emails/t.html"
+check "a --!> terminator cannot hide a violation" "contrast"
+
+# `<!--` inside RCDATA/RAWTEXT is literal text, not a comment opener.
+for el in textarea title style; do
+  EXTRA="<tr><td bgcolor=\"#FFFDF9\"><font color=\"#FFFDF9\">faint</font></td></tr>" write_template
+  sed -i "1i <$el><!--</$el>" "$FIX/emails/t.html"
+  check "a <$el> cannot be used to open a fake comment" "contrast"
+done
+
+# ...and the opposite direction: <!--> is a COMPLETE empty comment in HTML5,
+# so reporting it as unterminated was a false positive.
+EXTRA='<!-->' write_template
+check "an empty <!--> comment is not reported as unterminated" ""
+
+# --- a colour must never be invented from a filename ----------------------
+# `_COLOUR_TOKEN`'s bare-word arm read inside url(), so any path segment that
+# happened to be a CSS colour name became the resolved ground. Renaming a hero
+# image was enough to silence a real contrast error - no adversary required.
+EXTRA='<tr><td style="background: url(assets/navy-hero.png);"><font color="#FFFDF9">faint</font></td></tr>' write_template
+check "does not read a colour out of a url() path" "unreadable-colour"
+
+# The same rule must not turn every decorative background into an error.
+EXTRA='<tr><td style="background: url(assets/navy-hero.png);"></td></tr>' write_template
+check "an image ground with no text over it raises nothing" ""
+
+# A button on an image ground has no measurable edge - say so rather than
+# measuring against a colour it does not sit on.
+EXTRA="" write_template
+sed -i 's|<tr><td style="background-color:#FFFDF9;padding:32px;">|<tr><td style="background: url(band.png);padding:32px;">|' "$FIX/emails/t.html"
+check "reports a CTA sitting on an image ground" "background IMAGE"
+
+# An explicit colour alongside a url() is still found.
+EXTRA='<tr><td style="background: url(hero.png) #FFFDF9;"><font color="#FFFDF9">faint</font></td></tr>' write_template
+check "finds the colour when a url() precedes it" "contrast"
+
+# --- inputs that used to escape the handlers entirely ---------------------
+EXTRA="" write_template
+python3 - "$FIX/.claude/project-config.json" <<'PY2'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["mail_design"]["copy"]["forbidden_patterns"] = [{"pattern": "a{1,4294967296}", "message": "x"}]
+json.dump(d, open(sys.argv[1], "w"))
+PY2
+check "a repetition count too large is a config defect, not a crash" "config"
+python3 - "$FIX/.claude/project-config.json" <<'PY2'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["mail_design"]["copy"]["forbidden_patterns"] = [{"pattern": "—", "message": "em dash"}]
+json.dump(d, open(sys.argv[1], "w"))
+PY2
+
+# A non-finite component must not resolve to a real-looking colour that then
+# gets reported as a MEASURED ratio.
+out=$(python3 - "$HOOK_DIR/mail-lint.py" <<'PY2'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("ml", sys.argv[1])
+m = importlib.util.module_from_spec(spec); sys.modules["ml"] = m; spec.loader.exec_module(m)
+bad = [v for v in ("rgb(inf,0,0)", "rgb(1e400,0,0)", "hsl(nan,50%,50%)", "hsl(inf,50%,50%)")
+       if m._resolve_colour(v) is not None]
+print("LEAKED:" + ",".join(bad) if bad else "ALLNONE")
+print("SANE" if m._resolve_colour("hsl(120,100%,25%)") == "#008000" else "BROKEN")
+PY2
+)
+if [ "$(printf '%s' "$out" | head -1)" = "ALLNONE" ] && [ "$(printf '%s' "$out" | tail -1)" = "SANE" ]; then
+  echo "  PASS: a non-finite colour component resolves to nothing, not a number"; PASS=$((PASS + 1))
+else
+  echo "  FAIL: a non-finite colour component resolves to nothing, not a number — $out"; FAIL=$((FAIL + 1))
+fi
+
+# Untrusted config reaching the CI stream must not be able to start a line at
+# column 0, where GitHub Actions parses ::workflow-commands::.
+EXTRA="" write_template
+python3 - "$FIX/.claude/project-config.json" <<'PY2'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["mail_design"]["template_globs"] = ["emails/**/*.html", "dead/\n::error::INJECTED\nx/*.html"]
+json.dump(d, open(sys.argv[1], "w"))
+PY2
+if [ "$(run | grep -c '^::')" = "0" ]; then
+  echo "  PASS: an injected workflow command cannot reach column 0 of stdout"; PASS=$((PASS + 1))
+else
+  echo "  FAIL: an injected workflow command cannot reach column 0 of stdout"; FAIL=$((FAIL + 1))
+fi
+python3 - "$FIX/.claude/project-config.json" <<'PY2'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["mail_design"]["template_globs"] = ["emails/**/*.html"]
+json.dump(d, open(sys.argv[1], "w"))
+PY2
+
 # --- colour grammar -------------------------------------------------------
 # The contrast layer used to read hex and nothing else, so the most common
 # ground spelling in hand-written email was invisible and a 1.03:1 body

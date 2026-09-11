@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import os
 import re
 import signal
@@ -182,6 +183,18 @@ def contrast(fg: str, bg: str) -> float:
 # --------------------------------------------------------------------------
 
 
+def _flat(s: str) -> str:
+    """
+    Collapse control characters so untrusted text cannot start a new line at
+    column 0 of the CI step's stdout, which is where GitHub Actions parses
+    ::workflow-commands::. This lived inside Finding.render and so guarded
+    exactly one of the three places untrusted strings reach that stream - the
+    skip list and the no-match message were both still raw, and the glob-drift
+    skip added in the same round put adopter config straight onto one of them.
+    """
+    return re.sub(r"[\r\n\x00-\x08\x0b\x0c\x0e-\x1f]", "\u2423", str(s))
+
+
 @dataclass
 class Finding:
     severity: str  # error | warn | info
@@ -191,12 +204,6 @@ class Finding:
     line: int = 0
 
     def render(self) -> str:
-        # A newline in a path or an echoed capture would put the next line at
-        # column 0 of the CI step's stdout, which is where GitHub Actions looks
-        # for ::workflow-commands::. Keep every finding on the lines we chose.
-        def _flat(s: str) -> str:
-            return re.sub(r"[\r\n\x00-\x08\x0b\x0c\x0e-\x1f]", "\u2423", str(s))
-
         where = f"{_flat(self.path)}:{self.line}" if self.line else _flat(self.path)
         return f"  [{self.severity.upper():5}] {self.rule:28} {where}\n           {_flat(self.message)}"
 
@@ -231,9 +238,15 @@ REGEX_INPUT_CAP = 200_000
 MAX_TEMPLATE_BYTES = 2_000_000
 
 
-# Env-overridable so the regression test can pin the guard without paying the
-# full ceiling in wall-clock. The guard itself is not optional.
-REGEX_TIMEOUT_SECONDS = max(1, int(os.environ.get("MAIL_LINT_REGEX_TIMEOUT") or 5))
+# A TEST SEAM, not a trust boundary - it is set by the workflow file, and
+# anyone who can set it can equally delete the lint step, so it grants no new
+# privilege. It is clamped anyway: unclamped, `=99999999` was a three-year
+# alarm (the guard silently off, with no trace in the output) and a
+# non-integer value raised at IMPORT, so the linter would not start at all.
+try:
+    REGEX_TIMEOUT_SECONDS = min(60, max(1, int(float(os.environ.get("MAIL_LINT_REGEX_TIMEOUT") or 5))))
+except (TypeError, ValueError):
+    REGEX_TIMEOUT_SECONDS = 5
 
 
 class _RegexTimeout(Exception):
@@ -303,7 +316,7 @@ def _safe_compile(pattern: str, where: str, path: str, rep: Report):
     """Compile config-supplied regex, reporting rather than crashing."""
     try:
         return re.compile(pattern)
-    except (re.error, RecursionError) as exc:
+    except (re.error, RecursionError, OverflowError) as exc:
         rep.add(
             "error",
             "config",
@@ -642,17 +655,31 @@ def _resolve_colour(tok: str) -> str | None:
                 if not all(0 <= v <= 255 for v in vals):
                     return None
                 return "#%02x%02x%02x" % tuple(vals)
-            h = float(re.sub(r"deg$", "", parts[0])) % 360 / 360
+            raw_h = float(re.sub(r"deg$", "", parts[0]))
             s = float(parts[1].rstrip("%")) / 100
             ll = float(parts[2].rstrip("%")) / 100
+            # The 0..1 guard covered saturation and lightness but not hue, and
+            # `nan % 360` is nan - which colorsys turns into a finite-looking
+            # channel, then reported as a MEASURED ratio.
+            if not all(math.isfinite(v) for v in (raw_h, s, ll)):
+                return None
             if not (0 <= s <= 1 and 0 <= ll <= 1):
                 return None
+            h = raw_h % 360 / 360
             import colorsys
             r, g, b = colorsys.hls_to_rgb(h, ll, s)
             return "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
-        except ValueError:
+        except (ValueError, OverflowError):
             return None
     return None
+
+
+# A background IMAGE of unknown colour. Distinct from "no background here":
+# an element inside one must not quietly inherit its grandparent's ground and
+# get measured against a colour it does not actually sit on.
+UNKNOWN_GROUND = "?image"
+
+_FUNC_HEAD = re.compile(r"\b([a-zA-Z][a-zA-Z0-9-]*)\s*\(")
 
 
 def _colour_in(value: str) -> tuple[str | None, str | None]:
@@ -660,13 +687,52 @@ def _colour_in(value: str) -> tuple[str | None, str | None]:
     First trustworthy colour in a declaration value, plus the first token that
     looked like a colour and was NOT trustworthy.
 
-    Returning the unresolved token matters as much as returning the colour:
-    dropping it silently is how `bgcolor="white"` became invisible.
-    `background: url(hero.png) #FFFDF9` is why this scans the whole value
-    rather than only the first token after the colon.
+    Functional notation that is not a colour function is EXCISED before the
+    bare-word scan. Without that, `_COLOUR_TOKEN`'s word alternative reads
+    inside `url(...)`, and any 3-25 letter path segment that happens to be a
+    CSS colour name becomes the resolved ground:
+
+        background: url(assets/navy-hero.png)   ->  #000080
+
+    That needs no adversary - only a hero image named after a colour - and it
+    breaks both ways: a fabricated dark ground hides a real contrast failure,
+    and a fabricated light one invents an ERROR on correct markup. It is the
+    same fabrication the alpha-rejection above exists to prevent, reached
+    through a different door.
+
+    A value carrying only `url(...)` comes back UNRESOLVED rather than "no
+    colour": text over an image of unknown colour is precisely what cannot be
+    measured, and saying nothing about it is how the first version of this
+    function went quiet on `bgcolor="white"`.
     """
+    cleaned: list[str] = []
+    saw_url = False
+    i = 0
+    while i < len(value):
+        m = _FUNC_HEAD.search(value, i)
+        if not m:
+            cleaned.append(value[i:])
+            break
+        cleaned.append(value[i:m.start()])
+        depth, j = 0, m.end() - 1
+        while j < len(value):
+            if value[j] == "(":
+                depth += 1
+            elif value[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        fn = m.group(1).lower()
+        if fn in ("rgb", "rgba", "hsl", "hsla"):
+            cleaned.append(value[m.start():j + 1])
+        elif fn == "url":
+            saw_url = True
+        i = j + 1
+
+    scan = "".join(cleaned)
     unresolved = None
-    for m in _COLOUR_TOKEN.finditer(value):
+    for m in _COLOUR_TOKEN.finditer(scan):
         tok = m.group(0)
         if tok.strip().lower() in _NO_COLOUR:
             continue
@@ -675,6 +741,8 @@ def _colour_in(value: str) -> tuple[str | None, str | None]:
             return got, None
         if unresolved is None and (tok.startswith("#") or "(" in tok or tok.lower() in _NAMED):
             unresolved = tok
+    if unresolved is None and saw_url:
+        unresolved = "url(...)"
     return None, unresolved
 
 
@@ -708,21 +776,35 @@ class Element:
     unresolved: tuple[str, ...] = ()   # colour values declared here but not readable
 
 
+# Elements whose content is RCDATA or RAWTEXT. A parser does not tokenize
+# comments inside these, so `<!--` in a <title> is literal text - but a scanner
+# that does not know that will open a comment at it and blank the rest of the
+# document out of the linter's view.
+_RAWTEXT = ("title", "textarea", "style", "script", "xmp", "iframe",
+            "noembed", "noframes", "plaintext")
+
+_TAG_HEAD = re.compile(r"<(/?)([a-zA-Z][\w-]*)")
+
+
 def _comment_spans(text: str) -> tuple[list[tuple[int, int]], list[int]]:
     """
     Find the spans a mail client would treat as comments - and only those.
 
-    The naive `<!--.*?-->` this replaced could be opened from inside a quoted
-    attribute value, where `<!--` is literal text to every real client. That
-    let an author blank arbitrary markup out of the linter's view and ship a
-    1.12:1 body with the gate green - the "quietly switch the gate off"
-    failure this module exists to prevent. So the scan walks tags properly and
-    only opens a comment at document level.
+    Three things make this harder than `<!--.*?-->`, and all three were found by
+    someone attacking it rather than reading it:
 
-    Returns the spans plus the offsets of any unterminated `<!--`. An
-    unterminated opener is NOT treated as a comment: doing so would swallow
-    the rest of the document and hand back the same suppression primitive
-    through a shorter door. The caller reports it instead.
+    - A `<!--` inside a QUOTED ATTRIBUTE VALUE is literal text to every client.
+    - `--!>` also closes a comment (WHATWG 13.2.5.52, comment-end-bang state),
+      so a scanner that only looks for `-->` keeps swallowing past the point a
+      client resumed rendering.
+    - `<!--` inside RCDATA/RAWTEXT (<title>, <textarea>, <style>, <script>) is
+      literal text for the same reason.
+
+    Each one was a way to blank a 1.12:1 body out of the linter's view and ship
+    it with the gate green - the template silencing the check on itself, which
+    is the one thing this file cannot allow. An unterminated `<!--` is likewise
+    NOT treated as a comment: obeying it would swallow the rest of the document
+    and hand the primitive back through a shorter door. The caller reports it.
     """
     spans: list[tuple[int, int]] = []
     unterminated: list[int] = []
@@ -731,20 +813,38 @@ def _comment_spans(text: str) -> tuple[list[tuple[int, int]], list[int]]:
         lt = text.find("<", i)
         if lt < 0:
             break
+
         if text.startswith("<!--", lt):
-            end = text.find("-->", lt + 4)
-            if end < 0:
-                unterminated.append(lt)
-                break
-            spans.append((lt, end + 3))
-            i = end + 3
+            # `<!-->` and `<!--->` are COMPLETE empty comments in HTML5
+            # (abrupt-closing-of-empty-comment). Reporting them as unterminated
+            # was a false positive.
+            for lit in ("<!--->", "<!-->"):
+                if text.startswith(lit, lt):
+                    spans.append((lt, lt + len(lit)))
+                    i = lt + len(lit)
+                    break
+            else:
+                a = text.find("-->", lt + 4)
+                b = text.find("--!>", lt + 4)
+                if a < 0 and b < 0:
+                    unterminated.append(lt)
+                    break
+                if b >= 0 and (a < 0 or b < a):
+                    spans.append((lt, b + 4))
+                    i = b + 4
+                else:
+                    spans.append((lt, a + 3))
+                    i = a + 3
             continue
+
         nxt = text[lt + 1] if lt + 1 < n else ""
         if not (nxt.isalpha() or nxt in "/!?"):
             # A bare `<` in prose. Not a tag; stepping over it keeps a later
             # real comment visible.
             i = lt + 1
             continue
+
+        head = _TAG_HEAD.match(text, lt)
         j, quote = lt + 1, ""
         while j < n:
             c = text[j]
@@ -757,6 +857,11 @@ def _comment_spans(text: str) -> tuple[list[tuple[int, int]], list[int]]:
                 break
             j += 1
         i = j + 1
+
+        if head and not head.group(1) and head.group(2).lower() in _RAWTEXT:
+            close = re.compile(rf"</{re.escape(head.group(2))}\b", re.I).search(text, i)
+            i = close.start() if close else n
+
     return spans, unterminated
 
 
@@ -832,6 +937,13 @@ def parse_elements(text: str) -> tuple[Element, ...]:
         else:
             am = BG_ATTR_RE.search(whole)
             own_bg, bad_bg = _colour_in(_attr_value(am)) if am else (None, None)
+        if bad_bg == "url(...)":
+            # Not a finding here - the text that cannot be measured is usually
+            # in a CHILD element, so the unknown travels down the stack and is
+            # reported where the text actually is. Erroring on the container
+            # itself would fire on every decorative background, which is the
+            # ERROR-on-correct-markup failure this file keeps relearning.
+            own_bg, bad_bg = UNKNOWN_GROUND, None
         if bad_bg:
             bad.append(bad_bg)
 
@@ -883,7 +995,8 @@ def _bands(text: str) -> list[tuple[int, str, str]]:
     return [
         (e.offset, e.own_bg, e.tag)
         for e in parse_elements(text)
-        if e.own_bg and e.tag in ("td", "th") and e.cell_depth == 0
+        if e.own_bg and e.own_bg != UNKNOWN_GROUND
+        and e.tag in ("td", "th") and e.cell_depth == 0
     ]
 
 
@@ -915,7 +1028,19 @@ def check_contrast(text: str, path: str, cfg: dict, rep: Report) -> None:
                 path,
                 line_of(text, el.offset),
             )
-        if not el.fg or not el.ground:
+        if el.fg and el.ground == UNKNOWN_GROUND:
+            rep.add(
+                "error",
+                "unreadable-colour",
+                "This text sits on a background IMAGE, so its contrast cannot be "
+                "measured and nothing here was checked. Set an explicit background "
+                "colour behind the image - clients that block images show it, and it "
+                "is the colour the text is actually judged against.",
+                path,
+                line_of(text, el.offset),
+            )
+            continue
+        if not el.fg or not el.ground or el.ground == UNKNOWN_GROUND:
             continue
         measured += 1
         if (el.fg, el.ground) in exceptions:
@@ -963,6 +1088,17 @@ def check_cta(text: str, path: str, cfg: dict, rep: Report) -> None:
         occurrences += 1
         ground = el.parent_ground
         if not ground:
+            continue
+        if ground == UNKNOWN_GROUND:
+            rep.add(
+                "error",
+                "cta-ground",
+                "The call to action sits on a background IMAGE, so the edge contrast "
+                "that decides whether the button is visible at all cannot be measured. "
+                "Put it on an explicit ground colour.",
+                path,
+                line_of(text, el.offset),
+            )
             continue
         ratio = contrast(fill, ground)
         # The MEASURED floor, enforced independently of the allowlist. This was
@@ -1313,7 +1449,7 @@ def main(argv: list[str]) -> int:
     rep = Report()
     targets = resolve_targets(args.paths, cfg, root, rep)
     if not targets and not rep.findings:
-        msg = ("mail-lint: no templates matched " + (", ".join(args.paths) if args.paths
+        msg = ("mail-lint: no templates matched " + (", ".join(_flat(p) for p in args.paths) if args.paths
                else ", ".join(cfg.get("template_globs") or [])) +
                " - NOTHING WAS CHECKED.")
         print(msg, file=sys.stderr)
@@ -1346,7 +1482,7 @@ def main(argv: list[str]) -> int:
     if rep.skipped:
         print("SKIPPED — these checks did not run, so this report says nothing about them:")
         for s in rep.skipped:
-            print(f"  - {s}")
+            print(f"  - {_flat(s)}")
         print()
     print("clean" if not rep.findings else f"{rep.errors} error(s), {len(rep.findings) - rep.errors} advisory")
     return 1 if rep.errors else 0
