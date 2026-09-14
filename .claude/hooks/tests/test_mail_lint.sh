@@ -64,6 +64,32 @@ ${EXTRA:-}
 HTML
 }
 
+# ---------------------------------------------------------------------------
+# In-place editing, portably.
+#
+# Every mutation below was written as `sed -i 's/.../.../' file`, which is GNU
+# syntax. BSD sed (macOS) requires an ARGUMENT to -i, so it read the script as
+# a backup suffix and the filename as the script, errored to stderr, and left
+# the file UNCHANGED. The defect never got planted, the linter correctly
+# reported a still-clean template, and 22 tests failed with an empty-looking
+# "got:" - which reads exactly like the linter is broken. It was not; the
+# harness was. On Linux CI the same suite passes, so this only ever bit someone
+# running it on a Mac.
+#
+# Detect once, and keep every script below in plain sed.
+# ---------------------------------------------------------------------------
+if sed --version >/dev/null 2>&1; then
+  sedi() { sed -i "$@"; }        # GNU
+else
+  sedi() { sed -i '' "$@"; }     # BSD / macOS
+fi
+
+# `1i` is the other dialect split - BSD requires a backslash-newline before the
+# inserted text, GNU accepts it inline. Prepending a line needs no sed at all.
+prepend() { # text, file
+  printf '%s\n' "$1" | cat - "$2" > "$2.prepend" && mv "$2.prepend" "$2"
+}
+
 run() { python3 "$LINT" --root "$FIX" ${RUN_ARGS:-} 2>&1; }
 
 check() { # name, expect-substring ("" = expect clean)
@@ -88,7 +114,7 @@ EXTRA="" write_template
 check "a spec-compliant template lints clean" ""
 
 EXTRA="" write_template
-sed -i 's/color:#131110;">Body/color:rgba(19,17,16,0.7);">Body/' "$FIX/emails/t.html"
+sedi 's/color:#131110;">Body/color:rgba(19,17,16,0.7);">Body/' "$FIX/emails/t.html"
 check "rejects rgba()" "alpha-colour"
 
 # The realistic shape of the bug: a SINGLE-quoted style attribute carrying a
@@ -96,19 +122,19 @@ check "rejects rgba()" "alpha-colour"
 # spelled, so it is the form an author most easily reaches for - and it is
 # invisible to any regex whose character class excludes a quote.
 EXTRA="" write_template
-sed -i 's/, Georgia, serif;color/;color/' "$FIX/emails/t.html"
+sedi 's/, Georgia, serif;color/;color/' "$FIX/emails/t.html"
 check "catches a brand face with no fallback, double-quoted in a single-quoted attr" "font-fallback"
 
 EXTRA="" write_template
-sed -i 's/alt="" width="600"/width="600"/' "$FIX/emails/t.html"
+sedi 's/alt="" width="600"/width="600"/' "$FIX/emails/t.html"
 check "requires alt on every image" "img-attrs"
 
 EXTRA="" write_template
-sed -i 's/background-color:#FFFDF9;padding:32px;/background-color:#E3FF6B;padding:32px;/' "$FIX/emails/t.html"
+sedi 's/background-color:#FFFDF9;padding:32px;/background-color:#E3FF6B;padding:32px;/' "$FIX/emails/t.html"
 check "rejects the orange CTA on a lime band" "cta-ground"
 
 EXTRA="" write_template
-sed -i 's/<p style="color:#131110;">Body/<p style="color:#DCDAD6;">Body/' "$FIX/emails/t.html"
+sedi 's/<p style="color:#131110;">Body/<p style="color:#DCDAD6;">Body/' "$FIX/emails/t.html"
 check "computes contrast and fails a too-light body" "contrast"
 
 EXTRA='<tr><td style="background-color:#E3FF6B;padding:32px;"><p style="color:#131110;">Second</p></td></tr>' write_template
@@ -119,11 +145,11 @@ python3 -c "import io;p='$FIX/emails/t.html';s=open(p,encoding='utf-8').read();o
 check "rejects an em dash" "forbidden-pattern"
 
 EXTRA="" write_template
-sed -i 's|https://x.test/p.jpg|PHOTO_URL|' "$FIX/emails/t.html"
+sedi 's|https://x.test/p.jpg|PHOTO_URL|' "$FIX/emails/t.html"
 check "rejects a leftover placeholder" "placeholder"
 
 EXTRA="" write_template
-sed -i 's|<a href="https://x.test"|<a href="https://x.test/unsubscribe"|' "$FIX/emails/t.html"
+sedi 's|<a href="https://x.test"|<a href="https://x.test/unsubscribe"|' "$FIX/emails/t.html"
 python3 "$LINT" --root "$FIX" --family transactional 2>&1 | grep -qi "unsubscribe" \
   && { echo "  PASS: rejects unsubscribe in a family that forbids it"; PASS=$((PASS + 1)); } \
   || { echo "  FAIL: rejects unsubscribe in a family that forbids it"; FAIL=$((FAIL + 1)); }
@@ -146,35 +172,35 @@ check "attributes the button label to the button, not the band it sits in" ""
 # ---------------------------------------------------------------------------
 
 EXTRA="" write_template
-sed -i 's|<table cellpadding="0" cellspacing="0" width="600"|<style>.x{color:red}</style><table cellpadding="0" cellspacing="0" width="600"|' "$FIX/emails/t.html"
+sedi 's|<table cellpadding="0" cellspacing="0" width="600"|<style>.x{color:red}</style><table cellpadding="0" cellspacing="0" width="600"|' "$FIX/emails/t.html"
 check "rejects a <style> block carrying layout" "style-block"
 
 EXTRA="" write_template
-sed -i 's|<table cellpadding="0" cellspacing="0" width="600"|<link href="https://fonts.googleapis.com/css2?family=X" rel="stylesheet"><table cellpadding="0" cellspacing="0" width="600"|' "$FIX/emails/t.html"
+sedi 's|<table cellpadding="0" cellspacing="0" width="600"|<link href="https://fonts.googleapis.com/css2?family=X" rel="stylesheet"><table cellpadding="0" cellspacing="0" width="600"|' "$FIX/emails/t.html"
 check "rejects a third-party font host" "font-privacy"
 
 EXTRA="" write_template
-sed -i 's|<p style="color:#131110;">Body|<script>alert(1)</script><p style="color:#131110;">Body|' "$FIX/emails/t.html"
+sedi 's|<p style="color:#131110;">Body|<script>alert(1)</script><p style="color:#131110;">Body|' "$FIX/emails/t.html"
 check "rejects a script tag" "script"
 
 EXTRA="" write_template
-sed -i 's|alt="Salto" width="88"|alt="Salto" width="88" style="filter:brightness(0) invert(1);"|' "$FIX/emails/t.html"
+sedi 's|alt="Salto" width="88"|alt="Salto" width="88" style="filter:brightness(0) invert(1);"|' "$FIX/emails/t.html"
 check "rejects a CSS filter - the logo-knockout trick that fails in many clients" "css-filter"
 
 EXTRA="" write_template
-sed -i 's|<img src="https://x.test/p.jpg" alt="" width="600" />|<img src="https://x.test/p.jpg" alt="" />|' "$FIX/emails/t.html"
+sedi 's|<img src="https://x.test/p.jpg" alt="" width="600" />|<img src="https://x.test/p.jpg" alt="" />|' "$FIX/emails/t.html"
 check "requires an explicit width on every image" "img-attrs"
 
 EXTRA="" write_template
-sed -i 's|<p style="color:#131110;">Body|<div style="display:flex;">flex</div><p style="color:#131110;">Body|' "$FIX/emails/t.html"
+sedi 's|<p style="color:#131110;">Body|<div style="display:flex;">flex</div><p style="color:#131110;">Body|' "$FIX/emails/t.html"
 check "rejects modern layout Outlook cannot render" "modern-layout"
 
 EXTRA="" write_template
-sed -i 's/600/640/g' "$FIX/emails/t.html"
+sedi 's/600/640/g' "$FIX/emails/t.html"
 check "warns when the fixed column width is absent" "column-width"
 
 EXTRA="" write_template
-sed -i 's|color:#131110;">Body|color:#AABBCC;">Body|' "$FIX/emails/t.html"
+sedi 's|color:#131110;">Body|color:#AABBCC;">Body|' "$FIX/emails/t.html"
 check "rejects a hex outside the palette" "palette"
 
 EXTRA="" write_template
@@ -192,7 +218,7 @@ PY2
 check "warns on more than one call to action" "cta-count"
 
 EXTRA="" write_template
-sed -i '/<img src="https:\/\/x.test\/p.jpg"/d' "$FIX/emails/t.html"
+sedi '/<img src="https:\/\/x.test\/p.jpg"/d' "$FIX/emails/t.html"
 check "requires a photograph in a family that mandates one" "photograph"
 
 EXTRA='<tr><td style="background-color:#FFFDF9;padding:32px;"><p style="color:#131110;">Adjacent</p></td></tr>' write_template
@@ -214,7 +240,7 @@ PY2
 check "sees a bgcolor ground and measures contrast against it" "contrast"
 
 EXTRA="" write_template
-sed -i 's|color:#131110;">Body|color:#ddd;">Body|' "$FIX/emails/t.html"
+sedi 's|color:#131110;">Body|color:#ddd;">Body|' "$FIX/emails/t.html"
 check "sees three-digit hex" "palette"
 
 # The MSO ghost-table idiom is deliberately unbalanced across two comments and
@@ -264,13 +290,13 @@ check "an unterminated comment is reported, not obeyed" "unterminated-comment"
 
 # `--!>` closes a comment (WHATWG 13.2.5.52, comment-end-bang state).
 EXTRA='<tr><td bgcolor="#FFFDF9"><font color="#FFFDF9">faint</font></td></tr>' write_template
-sed -i '1i <!-- harmless --!>' "$FIX/emails/t.html"
+prepend '<!-- harmless --!>' "$FIX/emails/t.html"
 check "a --!> terminator cannot hide a violation" "contrast"
 
 # `<!--` inside RCDATA/RAWTEXT is literal text, not a comment opener.
 for el in textarea title style; do
   EXTRA="<tr><td bgcolor=\"#FFFDF9\"><font color=\"#FFFDF9\">faint</font></td></tr>" write_template
-  sed -i "1i <$el><!--</$el>" "$FIX/emails/t.html"
+  prepend "<$el><!--</$el>" "$FIX/emails/t.html"
   check "a <$el> cannot be used to open a fake comment" "contrast"
 done
 
@@ -293,7 +319,7 @@ check "an image ground with no text over it raises nothing" ""
 # A button on an image ground has no measurable edge - say so rather than
 # measuring against a colour it does not sit on.
 EXTRA="" write_template
-sed -i 's|<tr><td style="background-color:#FFFDF9;padding:32px;">|<tr><td style="background: url(band.png);padding:32px;">|' "$FIX/emails/t.html"
+sedi 's|<tr><td style="background-color:#FFFDF9;padding:32px;">|<tr><td style="background: url(band.png);padding:32px;">|' "$FIX/emails/t.html"
 check "reports a CTA sitting on an image ground" "visible at all"
 
 # An image-backed wrapper must not SHADOW the bands inside it. The sentinel is
@@ -408,19 +434,19 @@ check "refuses 8-digit RGBA rather than dropping its alpha" "unreadable-colour"
 # width="100%" is what every ESP emits for a full-bleed hero. Reading `100` out
 # of it failed CI on a correct template at ERROR severity.
 EXTRA="" write_template
-sed -i 's|<img src="https://x.test/p.jpg" alt="" width="600" />|<img src="https://x.test/p.jpg" alt="" width="100%" style="width:600px" />|' "$FIX/emails/t.html"
+sedi 's|<img src="https://x.test/p.jpg" alt="" width="600" />|<img src="https://x.test/p.jpg" alt="" width="100%" style="width:600px" />|' "$FIX/emails/t.html"
 check "accepts a full-bleed hero sized in percent with a pixel style" ""
 
 # ...and the rule must still bite when there is genuinely no photograph.
 EXTRA="" write_template
-sed -i 's|<tr><td style="font-size:0;"><img src="https://x.test/p.jpg" alt="" width="600" /></td></tr>||' "$FIX/emails/t.html"
+sedi 's|<tr><td style="font-size:0;"><img src="https://x.test/p.jpg" alt="" width="600" /></td></tr>||' "$FIX/emails/t.html"
 check "still requires a photograph when none is present" "requires a photograph"
 
 # --- sites that survived mutation ----------------------------------------
 # Each of these was deletable with the suite still green, and each is the
 # direct subject of a fix claimed in this PR.
 EXTRA="" write_template
-sed -i 's/background-color:#E3FF6B;padding:32px;/background-color:#FFFDF9;padding:32px;/' "$FIX/emails/t.html"
+sedi 's/background-color:#E3FF6B;padding:32px;/background-color:#FFFDF9;padding:32px;/' "$FIX/emails/t.html"
 RUN_ARGS="--family marketing" check "reports a family with no signature band" "No signature band found"
 
 EXTRA="" write_template
@@ -430,7 +456,7 @@ d = json.load(open(sys.argv[1]))
 d["mail_design"]["cta"]["allowed_grounds"] = ["#FFFDF9", "#EFEDE5"]
 json.dump(d, open(sys.argv[1], "w"))
 PY2
-sed -i 's/background-color:#FFFDF9;padding:32px;/background-color:#EFEDE5;padding:32px;/' "$FIX/emails/t.html"
+sedi 's/background-color:#FFFDF9;padding:32px;/background-color:#EFEDE5;padding:32px;/' "$FIX/emails/t.html"
 check "measures the CTA against its ground, not just the allowlist" "cta-contrast"
 python3 - "$FIX/.claude/project-config.json" <<'PY2'
 import json, sys
@@ -493,7 +519,7 @@ d = json.load(open(sys.argv[1]))
 d["mail_design"]["copy"]["forbidden_patterns"] = [{"pattern": "(a+)+$", "message": "redos"}]
 json.dump(d, open(sys.argv[1], "w"))
 PY2
-sed -i 's|<p style="color:#131110;">Body</p>|<p style="color:#131110;">aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab</p>|' "$FIX/emails/t.html"
+sedi 's|<p style="color:#131110;">Body</p>|<p style="color:#131110;">aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab</p>|' "$FIX/emails/t.html"
 out=$(MAIL_LINT_REGEX_TIMEOUT=1 run)
 if echo "$out" | grep -qi "did not finish within"; then
   echo "  PASS: a catastrophically backtracking config regex is abandoned, not run forever"; PASS=$((PASS + 1))
@@ -529,7 +555,7 @@ PY2
 
 # --- sites that survived the second mutation sweep ------------------------
 EXTRA='<tr><td><style>.x{color:red}</style></td></tr>' write_template
-sed -i 's|</style>||' "$FIX/emails/t.html"
+sedi 's|</style>||' "$FIX/emails/t.html"
 check "reports a <style> tag that is never closed" "style-block"
 
 EXTRA='<tr><td><style>@import url("local.css");</style></td></tr>' write_template
