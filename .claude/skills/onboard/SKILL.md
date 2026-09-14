@@ -7,6 +7,10 @@ effort: medium
 allowed-tools: Bash, Read, Write, Skill
 ---
 
+## Writing rule
+
+When this skill writes a durable artifact, read .claude/rules/writing-standard.md. Use the controlled technical writing profile.
+
 # /onboard — Guided First-Run Onboarding
 
 This is increment 1 of the guided-onboarding walking skeleton (technical
@@ -488,3 +492,17 @@ re-run-offer exits, and on any decline/cancel path. Never leave it set.
 ---
 
 *Part of [ApexYard](https://github.com/me2resh/apexyard) — multi-project SDLC framework for Claude Code · MIT.*
+
+### Harness adapter reconciliation
+
+After a project is registered, reconcile its declared harness adapters before
+starting the first ticket. The registry entry may include `adapters: [codex,
+pi, opencode, cursor]`. Run the portfolio manager in install mode for the new
+project:
+
+```bash
+bash bin/manage-portfolio-adapters.sh --install --project "{name}"
+```
+
+The command delegates to the existing per-harness generators. It never copies
+or changes canonical `.claude/hooks/*.sh` logic.

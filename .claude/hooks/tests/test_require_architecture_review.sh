@@ -117,8 +117,15 @@ install_mock_gh() {
 #!/bin/bash
 args="\$*"
 case "\$args" in
-  *"pr diff"*"--name-only"*)
-    printf '%s\n' $diff_files
+  *"api"*"pulls/77"*"changed_files"*)
+    if [ "\${MOCK_LARGE:-0}" = 1 ]; then printf '%s\n' 3001; else printf '%s\n' 1; fi
+    ;;
+  *"api"*"pulls/"*"/files"*)
+    if [ "\${MOCK_LARGE:-0}" = 1 ]; then
+      seq 1 3001 | sed 's|^|src/file-|; s|$|.ts|'
+    else
+      printf '%s\n' $diff_files
+    fi
     ;;
   *"pr view"*headRefOid*)
     printf '%s\n' "$head_sha"
@@ -248,13 +255,14 @@ args="\$*"
 case "\$args" in
   *"--repo $portfolio"*|*"repos/$portfolio/"*)
     case "\$args" in
-      *"pr diff"*"--name-only"*) printf '%s\n' $diff_files ;;
+      *"pulls/77"*"changed_files"*) printf '%s\n' 1 ;;
+      *"pulls/77/files"*) printf '%s\n' $diff_files ;;
       *"pr view"*headRefOid*)    printf '%s\n' "$head_sha" ;;
       *"pr view"*headRepository*) printf '%s\n' "$portfolio" ;;
       *) exit 0 ;;
     esac
     ;;
-  *"pr diff"*"--name-only"*) ;;    # bare → no files (ops-fork resolution)
+  *"pulls/77/files"*) ;;    # bare → no files (ops-fork resolution)
   *"pr view"*headRefOid*) ;;        # bare → empty
   *) exit 0 ;;
 esac
@@ -323,8 +331,12 @@ install_mock_gh_headrefoid_fails() {
 #!/bin/bash
 args="\$*"
 case "\$args" in
-  *"pr diff"*"--name-only"*)
-    printf '%s\n' $diff_files
+  *"pulls/"*"/files"*)
+    if [ "${MOCK_LARGE:-0}" = 1 ]; then
+      seq 1 3001 | sed 's|^|src/file-|; s|$|.ts|'
+    else
+      printf '%s\n' $diff_files
+    fi
     ;;
   *"pr view"*headRefOid*)
     exit 1
@@ -353,6 +365,14 @@ assert_eq "#1091: forge HEAD unresolvable + marker matching LOCAL head -> BLOCKE
 rm -rf "$sb"
 
 echo ""
+echo "B) PR over the files API ceiling -> BLOCK (exit 2)"
+sb=$(make_sandbox)
+install_mock_gh "$sb" '"src/handlers/user.ts"' "$SHA"
+code=$(MOCK_LARGE=1 run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "blocks when changed-file count exceeds 3000" "2" "$code"
+rm -rf "$sb"
+
+echo ""
 echo "E) #1091/#1099 control: forge healthy, marker at forge HEAD -> still ALLOWED"
 # Guards against over-blocking: proves the fail-closed change didn't also
 # start blocking the ordinary healthy-forge path.
@@ -361,6 +381,32 @@ install_mock_gh "$sb" '"projects/foo/docs/technical-design-x.md"' "$SHA"
 printf '%s\n' "$SHA" > "$(review_marker_path "o/r" 77 architecture "$sb")"
 code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
 assert_eq "#1091 control: gh healthy, marker at forge HEAD -> still ALLOWED" "0" "$code"
+rm -rf "$sb"
+
+echo ""
+echo "F) #1151 explicit wrapper repo outranks a leading cd target"
+sb=$(make_sandbox); pf=$(make_portfolio "me2resh/wrong-ops-repo")
+install_mock_gh_splitportfolio "$sb" '"projects/foo/docs/technical-design-x.md"' "$SHA" "$PF_SLUG"
+code=$(run_gate "$sb" "cd $pf && tracker_pr_merge \"$PF_SLUG\" \"77\" \"squash\" true")
+assert_eq "#1151 wrapper repo wins over cd-target and blocks" "2" "$code"
+rm -rf "$sb" "$pf"
+
+echo ""
+echo "F) #1151 unexpanded wrapper repo fails closed"
+sb=$(make_sandbox)
+install_mock_gh "$sb" '"projects/foo/docs/technical-design-x.md"' "$SHA"
+code=$(run_gate "$sb" 'tracker_pr_merge "$PR_HOST_REPO" "77" "squash" true')
+assert_eq "#1151 variable wrapper target blocks" "2" "$code"
+rm -rf "$sb"
+
+echo ""
+echo "F) #1151 unavailable diff fails closed"
+sb=$(make_sandbox)
+mkdir -p "$sb/bin"
+printf '%s\n' '#!/bin/bash' 'exit 1' > "$sb/bin/gh"
+chmod +x "$sb/bin/gh"
+code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "#1151 unresolvable diff blocks" "2" "$code"
 rm -rf "$sb"
 
 echo ""
