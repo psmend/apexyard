@@ -1,0 +1,130 @@
+# Mail Design Lint
+# Copy this to .github/workflows/mail-lint.yml in your project.
+#
+# Purpose: run the deterministic email-template linter on every PR that touches
+# a template, so a mail that breaks in Outlook, fails a contrast floor, names a
+# brand face with no fallback, or still carries a PHOTO_URL placeholder cannot
+# reach a patient.
+#
+# ## Why this is a CI job and not a PreToolUse merge hook
+#
+# The obvious shape for "lint gates the merge" in this framework is a hook on
+# `gh pr merge`, alongside block-unreviewed-merge.sh and friends. That is the
+# wrong tool here, for three reasons:
+#
+#   1. A PreToolUse hook only fires when the merge goes through Claude Code. A
+#      human pressing Merge in the GitHub UI bypasses it completely. For a
+#      *review* marker that is acceptable, because the marker is the record of
+#      a judgement a person made. For a *lint*, it means the gate is absent
+#      exactly when no agent is watching.
+#   2. A merge-time hook would have to re-fetch every changed template from the
+#      forge at PR HEAD to lint the right bytes — the local tree is usually not
+#      the PR branch. That is a lot of fragile shell in the trust chain, and
+#      AgDR-0104 is clear about what happens to hooks that grow complicated.
+#   3. It adds a new file under .claude/hooks/ and a new matcher in
+#      settings.json — both trust-chain surfaces that need a security pass —
+#      to achieve something CI already does better.
+#
+# Run it in CI instead and the existing `block-merge-on-red-ci.sh` turns it
+# into a merge gate for free: a red check blocks the merge through machinery
+# that is already written, already tested, and already covers both merge
+# shapes. Zero new trust-chain surface, and the author gets the finding on push
+# rather than at merge.
+#
+# The judgement half (Barid, via /mail-review) stays advisory and out of CI by
+# design — see .claude/agents/mail-reviewer.md § "Why you do not gate".
+
+name: Mail Design Lint
+
+on:
+  pull_request:
+    paths:
+      # Keep in sync with mail_design.template_globs in your project config.
+      - 'emails/**/*.html'
+      - '**/email-templates/**/*.html'
+      - '.claude/project-config.json'
+      - '.claude/hooks/mail-lint.py'
+
+permissions:
+  contents: read
+
+jobs:
+  mail-lint:
+    name: Lint email templates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Lint templates
+        run: |
+          if [ ! -f .claude/hooks/mail-lint.py ]; then
+            echo "::error::.claude/hooks/mail-lint.py is missing - is the apexyard .claude/ layer installed?"
+            exit 1
+          fi
+          # --require-match: this job only runs when a template path changed, so
+          # finding zero templates means the globs and the paths filter below
+          # have drifted apart and the gate is silently absent. Exit 2 (config
+          # broken) is distinct from exit 1 (templates broken).
+          python3 .claude/hooks/mail-lint.py --require-match
+
+      # A green check does NOT mean "fully audited" - it means nothing that ran
+      # failed. Surface what did not run, so a reader of a green job can see the
+      # difference.
+      #
+      # The first version of this step reported "All configured checks ran."
+      # whenever the JSON was missing - including when the linter had CRASHED,
+      # because `|| true` discarded the exit code and left a 0-byte file. A
+      # security review caught it. The step that exists to prevent silence about
+      # unrun checks was the one place producing it, so it now has a third state
+      # and never guesses.
+      - name: Report unchecked rules
+        if: always()
+        run: |
+          set +e
+          python3 .claude/hooks/mail-lint.py --json > /tmp/mail-lint.json 2>/tmp/mail-lint.err
+          lint_rc=$?
+          set -e
+
+          {
+            echo "### Mail lint"
+            if [ "$lint_rc" -ge 2 ] || [ ! -s /tmp/mail-lint.json ]; then
+              echo "⚠️ **The linter did not produce a report, so this run says nothing about any check.**"
+              echo ""
+              echo '```'
+              head -20 /tmp/mail-lint.err 2>/dev/null || echo "(no stderr captured)"
+              echo '```'
+            else
+              # Heredoc, not `python3 -c`. Every line of a -c program here is
+              # indented to sit inside the YAML block, and Python does not strip
+              # a common indent from -c - it raises IndentationError on line 2.
+              # Under `set -e` that failed the step on every run that produced a
+              # report, i.e. the HEALTHY path, red-lighting the job that
+              # block-merge-on-red-ci.sh reads. The step written to prevent
+              # silence about unrun checks would have blocked every clean merge.
+              skipped=$(python3 - <<'PY'
+import json
+d = json.load(open('/tmp/mail-lint.json'))
+for s in d.get('skipped', []):
+    print('- ' + s)
+PY
+              )
+              ran=$(python3 - <<'PY'
+import json
+d = json.load(open('/tmp/mail-lint.json'))
+print(len(d.get('checks_run', [])))
+PY
+              )
+              echo "$ran check(s) ran."
+              if [ -n "$skipped" ]; then
+                echo ""
+                echo "These did **not** run, so this result says nothing about them:"
+                echo "$skipped"
+                echo ""
+                echo "Configure them in \`.claude/project-config.json\` → \`mail_design\`."
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

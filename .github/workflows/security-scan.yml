@@ -104,9 +104,11 @@ jobs:
             semgrep/semgrep@sha256:59fbed6127ea7c5dde3ba6a85142733bb20ea9aaa36120c953904f1539aaf66e `# 1.168.0` \
             semgrep scan \
             --config=r/bash \
+            --config=r/python \
             --metrics=off \
             --no-autofix \
             --include="*.sh" \
+            --include="*.py" \
             --json \
             --output semgrep-results.json \
             .

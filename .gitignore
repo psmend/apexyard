@@ -77,3 +77,14 @@ workspace/*/
 # `git status` shows them as untracked symlinks — leave them alone.
 # If you absolutely want to suppress the untracked-symlink line, add the
 # specific name to .git/info/exclude on each clone.
+
+# Portfolio data lives in a separate private repo (split-portfolio v2).
+# See docs/multi-project.md.
+apexyard.projects.yaml
+projects
+onboarding.yaml
+workspace
+
+# Python bytecode (mail-lint.py is the only Python in the tree).
+__pycache__/
+*.pyc
