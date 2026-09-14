@@ -1418,7 +1418,13 @@ def main(argv: list[str]) -> int:
     ap.add_argument("paths", nargs="*", help="Template files or globs. Defaults to mail_design.template_globs.")
     ap.add_argument("--family", default="", help="Force a family instead of detecting it from the signature ground.")
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
-    ap.add_argument("--root", default=os.getcwd())
+    ap.add_argument(
+        "--root",
+        default=None,
+        help="Treat this directory as the project root: read its .claude/ config and "
+             "refuse templates outside it. When omitted, the root is DISCOVERED by "
+             "walking up from the working directory.",
+    )
     ap.add_argument(
         "--require-match",
         action="store_true",
@@ -1428,7 +1434,19 @@ def main(argv: list[str]) -> int:
     )
     args = ap.parse_args(argv)
 
-    root = _ops_root(args.root)
+    # An explicit --root is AUTHORITATIVE; only an omitted one is discovered.
+    #
+    # This used to be `_ops_root(args.root)`, which walked UP from the path it
+    # was given - so --root could be silently overridden by any ancestor
+    # carrying a marker, and the flag did not mean what it says. It made local
+    # runs and CI disagree about the same repository: in CI the project is
+    # checked out alone, so discovery stops at the repo and finds its config;
+    # locally the same repo sits inside a portfolio checkout whose marker files
+    # are one level up, so discovery sailed past the project, found no
+    # mail_design there, and exited 2. Same linter, same templates, same
+    # command, opposite results - with no way to force the right answer, because
+    # the flag for forcing it was the one being overridden.
+    root = args.root if args.root else _ops_root(os.getcwd())
     try:
         cfg = load_config(root)
     except ConfigError as exc:
