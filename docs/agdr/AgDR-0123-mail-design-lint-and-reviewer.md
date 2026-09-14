@@ -58,7 +58,11 @@ Chosen: **linter + advisory agent, gated in CI.**
 - `.claude/agents/mail-reviewer.md` - Barid. Judgement only, with the lint
   output already in its brief so it never re-derives what a formula settles.
   No Write/Edit tools, no marker.
-- `.claude/skills/mail-review/SKILL.md` - drives both.
+- `.claude/agents/mail-author.md` - Katib. The authoring half, added after the
+  first templates were built (see Postscript 4). Has Write/Edit, runs the linter
+  on its own output, and is explicitly barred from ruling on open design
+  questions or "fixing" accepted exceptions.
+- `.claude/skills/mail-review/SKILL.md` - drives the review pair.
 - `golden-paths/pipelines/mail-lint.yml` - the gate.
 
 **The highest-value thing Barid does is not aesthetic.** It asks whether a
@@ -107,7 +111,8 @@ when this fails.
 ## Artifacts
 
 - `.claude/hooks/mail-lint.py`, `.claude/hooks/tests/test_mail_lint.sh` (29 cases)
-- `.claude/agents/mail-reviewer.md`, `.claude/skills/mail-review/SKILL.md`
+- `.claude/agents/mail-reviewer.md` (Barid), `.claude/agents/mail-author.md` (Katib)
+- `.claude/skills/mail-review/SKILL.md`
 - `golden-paths/pipelines/mail-lint.yml`
 - `.claude/project-config.defaults.json` → `mail_design`
 
@@ -263,3 +268,37 @@ these five were not, and did not.
 ---
 
 *Part of [ApexYard](https://github.com/me2resh/apexyard) — multi-project SDLC framework for Claude Code · MIT.*
+
+## Postscript 4 - the authoring half, and why it is a separate agent
+
+Barid was built first, and the gap showed the moment real templates were
+written: the framework could *judge* an email template and *gate* it, but the
+thing that produced it was an unbriefed general agent rediscovering the spec
+each time. The linter catches what is mechanically wrong; nothing was carrying
+what is easy to get wrong on the way in.
+
+**Katib is deliberately a second agent rather than Write tools bolted onto
+Barid.** Three reasons:
+
+1. **A reviewer with Write tools stops being a reviewer.** Barid's value is that
+   it cannot quietly fix what it finds, so its findings have to survive being
+   read. Giving one agent both roles produces a template that has been graded
+   by its own author.
+2. **The briefs point in opposite directions.** Barid is told *not* to re-derive
+   anything the linter settles, because re-checking mechanics is where a model
+   wastes its judgement. Katib must think about exactly those mechanics, because
+   it is the one introducing them.
+3. **Only the author can create a defect.** The asymmetry is worth encoding:
+   Katib's brief is mostly prohibitions and process, Barid's is mostly axes of
+   judgement.
+
+The prohibitions are the load-bearing part, and each is a real failure rather
+than a hypothetical one: reporting a template clean when the brand checks had
+silently skipped; "improving" a contrast pair that a specification records as a
+deliberate accepted exception; and answering a question the spec marks `[open]`
+by writing a template that implies an answer. All three read as diligence in a
+diff, which is what makes them worth naming in a brief.
+
+Katib is also told to leave a guard behind whenever it fixes something a
+document was already supposed to prevent, and to watch that guard fail before
+trusting it - the same rule this AgDR's own postscripts arrived at the hard way.
