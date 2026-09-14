@@ -206,10 +206,10 @@ ApexYard ships with a `.claude/` directory containing the Claude Code primitives
 | Rules | `.claude/rules/` | 19 modular rule files (AgDR triggers, agent role selection, code standards, git conventions, glossary lookup, isolated builds, leak protection, loop mode, parallel work, plan mode, PR quality, PR workflow, reconcile before build, reporting style, right-size ceremony, role triggers, skill first, ticket vocabulary, workflow gates) |
 | Handbooks | `handbooks/` | Adopter-authored coding standards consumed by Rex during code review. Discovery by path-convention (`architecture/` + `general/` always-load; `language/<lang>/` loads on diff-match). Advisory by default; opt in to blocking via `ENFORCEMENT: blocking` marker. See [`handbooks/README.md`](handbooks/README.md). |
 | Agents | `.claude/agents/` | 25 sub-agents (6 utility incl. Hakim post-consolidation + Naqid the Contrarian + Barid the Mail Reviewer + Katib the Mail Author + 7 engineering + 1 architecture (Tariq) + 6 product-design + 5 security-data). Per AgDR-0050 + the #347 PR 3 Hatim→Hakim consolidation decision + AgDR-0054 (Solution Architect) + AgDR-0078 (The Contrarian) + AgDR-0105 (retiring the pr-manager + ticket-manager lifecycle agents) + AgDR-0123 (Barid + Katib). |
-| Skills | `.claude/skills/` | 67 slash commands — see the full list below |
+| Skills | `.claude/skills/` | 68 slash commands — see the full list below |
 | Settings | `.claude/settings.json` | Wires hooks to `PreToolUse`, `PostToolUse`, and `SessionStart` events |
 
-### Available skills (67)
+### Available skills (68)
 
 One-line summary per skill; canonical details live in each `.claude/skills/<name>/SKILL.md`.
 
@@ -281,6 +281,7 @@ One-line summary per skill; canonical details live in each `.claude/skills/<name
 | `/roadmap` | Update or create the product roadmap |
 | `/stakeholder-update` | Generate weekly / monthly / launch stakeholder updates |
 | `/fan-out` | Spawn N parallel agents in one message (per-task agent type, worktree isolation) |
+| `/mail-write` | Write or rebuild an HTML email template to the project's mail spec — Katib authors, the linter proves, the report says what was NOT checked (AgDR-0123) |
 | `/mail-review` | Audit HTML email templates — deterministic lint (contrast, palette, fonts, layout) plus Barid's judgement pass on register, copy and consent. Gated in CI (AgDR-0123) |
 
 The hooks, agents, and skills are picked up automatically by Claude Code when this directory lives at the project root. The rules are imported via `@.claude/rules/*.md` from your project's `CLAUDE.md`.
@@ -320,7 +321,7 @@ Copy whichever you need into your project's `.github/workflows/`. Full details i
 | Rules (modular, framework-wide) | `.claude/rules/` |
 | **Adopter handbooks** (consumed by Rex during code review) | `handbooks/` — see [`handbooks/README.md`](handbooks/README.md) for the discovery + advisory/blocking conventions |
 | Agents | `.claude/agents/` |
-| Skills (67 slash commands) | `.claude/skills/` |
+| Skills (68 slash commands) | `.claude/skills/` |
 | Hook wiring | `.claude/settings.json` |
 | **Per-project docs** | `projects/<name>/` |
 | **Live working copies** (gitignored) | `workspace/<name>/` |
