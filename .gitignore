@@ -36,7 +36,7 @@ onboarding.yaml
 
 # Live working copies of managed projects. Each is its own git repo — they
 # must not be double-tracked from the ops repo.
-workspace/*/
+workspace/*
 !workspace/README.md
 
 # Adopter-specific agent routing (single-fork mode; split-portfolio mode
@@ -77,3 +77,10 @@ workspace/*/
 # `git status` shows them as untracked symlinks — leave them alone.
 # If you absolutely want to suppress the untracked-symlink line, add the
 # specific name to .git/info/exclude on each clone.
+
+# Portfolio data lives in a separate private repo (split-portfolio v2).
+# See docs/multi-project.md.
+apexyard.projects.yaml
+projects
+onboarding.yaml
+workspace
